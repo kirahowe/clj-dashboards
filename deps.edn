@@ -1,0 +1,22 @@
+;; Workspace for developing clj-dashboards itself. The libraries live in
+;; core/ (for writing apps) and server/ (for hosting them); each has its
+;; own deps.edn and can be used on its own.
+{:deps {io.github.kirahowe/dashboards-core {:local/root "core"}
+        io.github.kirahowe/dashboards-server {:local/root "server"}}
+
+ :aliases
+ {;; Serve every example app: clojure -M:examples
+  :examples {:main-opts ["-m" "dashboards.server.main"
+                         "--apps-dir" "examples/apps"
+                         "--title" "clj-dashboards examples"]}
+
+  ;; The server CLI, for anything else: clojure -M:serve --app examples/apps/hello
+  :serve {:main-opts ["-m" "dashboards.server.main"]}
+
+  :dev {:extra-paths ["dev" "core/test" "server/test"]}
+
+  ;; Run every test: clojure -X:test
+  :test {:extra-paths ["core/test" "server/test"]
+         :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :exec-fn cognitect.test-runner.api/test
+         :exec-args {:dirs ["core/test" "server/test"]}}}}

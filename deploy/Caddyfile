@@ -1,0 +1,4 @@
+# Caddy proxies websockets with no extra configuration.
+dashboards.example.com {
+	reverse_proxy dashboards:8080
+}

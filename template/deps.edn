@@ -1,0 +1,31 @@
+;; A dashboard project of your own. Copy this directory, rename
+;; my-dashboard, and set :git/sha below to a commit of clj-dashboards
+;; (`git ls-remote https://github.com/kirahowe/clj-dashboards HEAD`).
+{:paths ["src" "resources"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.6"}
+        ;; For writing the app: UI, reactivity, rendering.
+        io.github.kirahowe/dashboards-core
+        {:git/url "https://github.com/kirahowe/clj-dashboards"
+         :git/sha "0000000000000000000000000000000000000000"
+         :deps/root "core"}
+        ;; For serving it. Only the infrastructure needs this.
+        io.github.kirahowe/dashboards-server
+        {:git/url "https://github.com/kirahowe/clj-dashboards"
+         :git/sha "0000000000000000000000000000000000000000"
+         :deps/root "server"}}
+
+ :aliases
+ {;; REPL-driven development: clj -M:dev, then (go) from dev/user.clj
+  :dev {:extra-paths ["dev"]}
+
+  ;; Serve the app: clojure -M:run  (http://localhost:8080/)
+  :run {:main-opts ["-m" "dashboards.server.main" "--app" "my-dashboard.app/app"]}
+
+  ;; Build a standalone jar: clojure -T:build uber
+  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.14"}}
+          :ns-default build}
+
+  ;; Only for trying the template inside the clj-dashboards repo itself.
+  :in-repo {:override-deps
+            {io.github.kirahowe/dashboards-core {:local/root "../core"}
+             io.github.kirahowe/dashboards-server {:local/root "../server"}}}}}

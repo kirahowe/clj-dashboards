@@ -1,0 +1,17 @@
+;; Configuration for the server image. Mount your own over
+;; /opt/dashboards/server.edn, or point DASHBOARDS_CONFIG elsewhere.
+;; Every key can also be given as a command-line flag (see --help).
+{:title "Dashboards"
+
+ ;; Each subdirectory with an app.clj is served at /<name>/; new ones
+ ;; are picked up without a restart.
+ :apps-dir "/srv/dashboards"
+
+ ;; Reload an app when its files change. Turn off for fixed deployments.
+ :reload? true
+
+ ;; Show users a generic message instead of exception details.
+ :sanitize-errors? true
+
+ ;; Refuse new sessions beyond this many (nil for no limit).
+ :max-sessions 200}

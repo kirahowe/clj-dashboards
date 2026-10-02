@@ -1,0 +1,4 @@
+;; The classpath of the server image: the server, the core library, and
+;; whatever else every hosted app should be able to use.
+{:deps {io.github.kirahowe/dashboards-core {:local/root "core"}
+        io.github.kirahowe/dashboards-server {:local/root "server"}}}
