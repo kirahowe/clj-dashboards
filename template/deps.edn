@@ -1,17 +1,17 @@
-;; A dashboard project of your own. Copy this directory, rename
-;; my-dashboard, and set :git/sha below to a commit of clj-dashboards
-;; (`git ls-remote https://github.com/kirahowe/clj-dashboards HEAD`).
+;; A dashboard project of your own. Copy this directory and rename
+;; my-dashboard. :git/sha pins the clj-dashboards version; to upgrade, set
+;; it to a newer commit (`git ls-remote https://github.com/kirahowe/clj-dashboards`).
 {:paths ["src" "resources"]
  :deps {org.clojure/clojure {:mvn/version "1.12.6"}
         ;; For writing the app: UI, reactivity, rendering.
         io.github.kirahowe/dashboards-core
         {:git/url "https://github.com/kirahowe/clj-dashboards"
-         :git/sha "0000000000000000000000000000000000000000"
+         :git/sha "e2aa1a23cbb31bdedb1588d73e9dab623f33063b"
          :deps/root "core"}
         ;; For serving it. Only the infrastructure needs this.
         io.github.kirahowe/dashboards-server
         {:git/url "https://github.com/kirahowe/clj-dashboards"
-         :git/sha "0000000000000000000000000000000000000000"
+         :git/sha "e2aa1a23cbb31bdedb1588d73e9dab623f33063b"
          :deps/root "server"}}
 
  :aliases

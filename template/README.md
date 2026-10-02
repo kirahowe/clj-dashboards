@@ -3,8 +3,8 @@
 A starting point for a dashboard of your own, built with
 [clj-dashboards](https://github.com/kirahowe/clj-dashboards).
 
-1. Copy this directory and set the `:git/sha` entries in `deps.edn` to a
-   clj-dashboards commit.
+1. Copy this directory. The `:git/sha` entries in `deps.edn` pin the
+   clj-dashboards version; point them at a newer commit to upgrade.
 2. Edit `src/my_dashboard/app.clj`. Data goes in `resources/`.
 3. Develop at the REPL: `clj -M:dev`, then `(go)`, then open
    http://localhost:8080/. Re-evaluate your code and reload the page.

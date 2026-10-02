@@ -184,8 +184,8 @@ the settings.
 
 ### 2. Your own project and uberjar
 
-Copy [`template/`](template), set the `:git/sha` in its `deps.edn`, and
-write your app in `src/`. Then:
+Copy [`template/`](template) (its `deps.edn` pins a clj-dashboards
+commit) and write your app in `src/`. Then:
 
 ```sh
 clojure -M:run                  # serve it locally
