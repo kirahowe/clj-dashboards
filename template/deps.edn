@@ -6,19 +6,19 @@
         ;; For writing the app: UI, reactivity, rendering.
         io.github.kirahowe/dashboards-core
         {:git/url "https://github.com/kirahowe/clj-dashboards"
-         :git/sha "e2aa1a23cbb31bdedb1588d73e9dab623f33063b"
+         :git/sha "937ff7e84ae6c7bacc4d19861b936944604fedd2"
          :deps/root "core"}
         ;; For serving it. Only the infrastructure needs this.
         io.github.kirahowe/dashboards-server
         {:git/url "https://github.com/kirahowe/clj-dashboards"
-         :git/sha "e2aa1a23cbb31bdedb1588d73e9dab623f33063b"
+         :git/sha "937ff7e84ae6c7bacc4d19861b936944604fedd2"
          :deps/root "server"}}
 
  :aliases
- {;; REPL-driven development: bb repl, then (go) from dev/user.clj
+ {;; REPL-driven development: bb dev, then (go) from dev/user.clj
   :dev {:extra-paths ["dev"]}
 
-  ;; Serve the app: bb run  (http://localhost:8080/)
+  ;; Serve the app: bb serve  (http://localhost:8080/)
   :run {:main-opts ["-m" "dashboards.server.main" "--app" "my-dashboard.app/app"]}
 
   ;; Build a standalone jar: bb uber

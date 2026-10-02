@@ -259,7 +259,7 @@ Copy [`template/`](template) (its `deps.edn` pins a clj-dashboards
 commit) and write your app in `src/`. Then:
 
 ```sh
-bb run                          # serve it locally
+bb serve                        # serve it locally
 bb uber                         # target/my-dashboard.jar
 java -jar target/my-dashboard.jar --app my-dashboard.app/app
 bb docker                       # or a small JRE image

@@ -5,11 +5,11 @@
  :tasks
  {:requires ([tasks])
 
-  run
-  {:doc "Serve the app at http://localhost:8080/ (PORT=3000 bb run for another port)"
+  serve
+  {:doc "Serve the app at http://localhost:8080/ (PORT=3000 bb serve for another port)"
    :task (shell "clojure -M:run")}
 
-  repl
+  dev
   {:doc "Start a REPL with dev/user.clj loaded; then (go)"
    :task (shell "clojure -M:dev")}
 

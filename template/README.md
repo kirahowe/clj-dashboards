@@ -6,7 +6,7 @@ A starting point for a dashboard of your own, built with
 1. Copy this directory. The `:git/sha` entries in `deps.edn` pin the
    clj-dashboards version; `bb upgrade` moves them to the latest commit.
 2. Edit `src/my_dashboard/app.clj`. Data goes in `resources/`.
-3. Develop at the REPL: `bb repl`, then `(go)`, then open
+3. Develop at the REPL: `bb dev`, then `(go)`, then open
    http://localhost:8080/. Re-evaluate your code and reload the page.
 
 You need the [Clojure CLI](https://clojure.org/guides/install_clojure)
@@ -14,8 +14,8 @@ and [Babashka](https://babashka.org) (`bb tasks` lists the tasks).
 
 | | |
 |---|---|
-| `bb run` | serve the app on port 8080 (`PORT` changes it) |
-| `bb repl` | a REPL with `(go)` and `(stop)` |
+| `bb serve` | serve the app on port 8080 (`PORT` changes it) |
+| `bb dev` | a REPL with `(go)` and `(stop)` |
 | `bb uber` | build `target/my-dashboard.jar` |
 | `java -jar target/my-dashboard.jar --app my-dashboard.app/app` | run the jar |
 | `bb docker` | build a container image (JRE only) |
