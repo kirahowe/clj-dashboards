@@ -17,6 +17,7 @@
   (:require [clojure.pprint :as pprint]
             [clojure.string :as str]
             [dashboards.html :as html]
+            [dashboards.ui :as dui]
             [scicloj.plotje.api :as pj]))
 
 (defn spec?
@@ -170,9 +171,9 @@
         (pose? x) (plot-html x opts)
         (string? x) (text-html x)
         (number? x) (text-html (html/format-cell x))
-        (hiccup? x) (html/hiccup->html x)
+        (hiccup? x) (html/hiccup->html (dui/expand x))
         (html/dataset-like? x) (html/hiccup->html (html/dataset->hiccup x opts))
-        (and (seq? x) (every? hiccup? x)) (html/hiccup->html x)
+        (and (seq? x) (every? hiccup? x)) (html/hiccup->html (dui/expand x))
         :else (print-html x))))
 
 (defn ->html

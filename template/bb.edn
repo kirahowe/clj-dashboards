@@ -1,0 +1,26 @@
+;; Scripts for this dashboard. `bb tasks` lists them.
+;; Tasks run the Clojure CLI (`clojure`), which must be installed.
+{:min-bb-version "1.3.0"
+ :paths ["bb"]
+ :tasks
+ {:requires ([tasks])
+
+  run
+  {:doc "Serve the app at http://localhost:8080/ (PORT=3000 bb run for another port)"
+   :task (shell "clojure -M:run")}
+
+  repl
+  {:doc "Start a REPL with dev/user.clj loaded; then (go)"
+   :task (shell "clojure -M:dev")}
+
+  uber
+  {:doc "Build target/my-dashboard.jar"
+   :task (shell "clojure -T:build uber")}
+
+  docker
+  {:doc "Build the container image my-dashboard"
+   :task (shell "docker build -t my-dashboard .")}
+
+  upgrade
+  {:doc "Point deps.edn at the latest clj-dashboards commit (or: bb upgrade <sha>)"
+   :task (tasks/upgrade (first *command-line-args*))}}}

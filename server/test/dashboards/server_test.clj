@@ -9,8 +9,9 @@
             [dashboards.server.apps :as apps]
             [dashboards.server.main :as main]
             [dashboards.ui :as ui])
-  (:import (java.net URI)
-           (java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers WebSocket WebSocket$Listener)
+  (:import (java.net URI URLEncoder)
+           (java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers)
+           (java.util.stream Stream)
            (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)
            (java.util.concurrent LinkedBlockingQueue TimeUnit)))
@@ -24,49 +25,81 @@
 
 (def ^:dynamic *server* nil)
 
+(defn- start-server [config]
+  (server/start! (merge {:port 0 :host "127.0.0.1"
+                         :apps [{:path "/" :app counter-app}
+                                {:path "/other" :app counter-app}]}
+                        config)))
+
 (use-fixtures :each
   (fn [t]
-    (let [s (server/start! {:port 0 :host "127.0.0.1"
-                            :apps [{:path "/" :app counter-app}
-                                   {:path "/other" :app counter-app}]})]
+    (let [s (start-server {})]
       (try (binding [*server* s] (t))
            (finally (server/stop! s))))))
 
 (defn- url [path] (str "http://127.0.0.1:" (:port *server*) path))
 
+(def ^:private client (HttpClient/newHttpClient))
+
 (defn- http-get [path]
-  (let [client (HttpClient/newHttpClient)
-        resp (.send client (.build (HttpRequest/newBuilder (URI. (url path))))
+  (let [resp (.send ^HttpClient client (.build (HttpRequest/newBuilder (URI. (url path))))
                     (HttpResponse$BodyHandlers/ofString))]
     {:status (.statusCode resp)
      :body (.body resp)
      :headers (into {} (map (fn [[k v]] [k (first v)])) (.map (.headers resp)))}))
 
-(defn- connect [path]
+(defn- post-signals [signals]
+  (let [req (-> (HttpRequest/newBuilder (URI. (url "/_dashboards/signals")))
+                (.header "Content-Type" "application/json")
+                (.POST (HttpRequest$BodyPublishers/ofString (json/write-json-str signals)))
+                (.build))]
+    (.statusCode (.send ^HttpClient client req (HttpResponse$BodyHandlers/discarding)))))
+
+(defn- open-stream
+  "Open a session's event stream with `signals`, as Datastar would.
+  Returns {:events queue :close fn}; each event is a map with :event
+  and :data (a map of Datastar data-line keys to values)."
+  [signals]
   (let [q (LinkedBlockingQueue.)
-        buf (StringBuilder.)
-        listener (reify WebSocket$Listener
-                   (onText [_ ws data last?]
-                     (.append buf data)
-                     (when last?
-                       (.put q (json/read-json (str buf) :key-fn keyword))
-                       (.setLength buf 0))
-                     (.request ws 1)
-                     nil))
-        ws (.join (.buildAsync (.newWebSocketBuilder (HttpClient/newHttpClient))
-                               (URI. (str/replace (url path) "http:" "ws:"))
-                               listener))]
-    {:ws ws :q q}))
+        req (.build (HttpRequest/newBuilder
+                     (URI. (str (url "/_dashboards/stream") "?datastar="
+                                (URLEncoder/encode (json/write-json-str signals) "UTF-8")))))
+        ^Stream lines (.body (.send ^HttpClient client req (HttpResponse$BodyHandlers/ofLines)))
+        reader (future
+                 (try
+                   (loop [it (.iterator lines) event nil data {}]
+                     (when (.hasNext it)
+                       (let [^String line (.next it)]
+                         (cond
+                           (str/blank? line)
+                           (do (when event (.put q {:event event :data data}))
+                               (recur it nil {}))
+                           (str/starts-with? line "event: ") (recur it (subs line 7) data)
+                           (str/starts-with? line "data: ")
+                           (let [[k v] (str/split (subs line 6) #" " 2)]
+                             (recur it event (update data k #(if % (str % "\n" v) (str v)))))
+                           :else (recur it event data)))))
+                   (catch Exception _ nil)))]
+    {:events q :close #(do (.close lines) (future-cancel reader))}))
 
-(defn- send-json [{:keys [^WebSocket ws]} m]
-  (.join (.sendText ws (json/write-json-str m) true)))
-
-(defn- await-msg [{:keys [^LinkedBlockingQueue q]} pred]
+(defn- await-event [{:keys [^LinkedBlockingQueue events]} pred]
   (loop []
-    (let [m (.poll q 10 TimeUnit/SECONDS)]
-      (cond (nil? m) (throw (ex-info "timed out waiting for a message" {}))
-            (pred m) m
+    (let [e (.poll events 10 TimeUnit/SECONDS)]
+      (cond (nil? e) (throw (ex-info "timed out waiting for an event" {}))
+            (pred e) e
             :else (recur)))))
+
+(defn- session-of [e]
+  (get-in (json/read-json (get-in e [:data "signals"])) ["dsh" "session"]))
+
+(defn- connected? [e]
+  (and (= "datastar-patch-signals" (:event e)) (session-of e)))
+
+(defn- output-for [id]
+  (fn [e] (and (= "datastar-patch-elements" (:event e))
+               (= (str "#" id) (get-in e [:data "selector"])))))
+
+(defn- sessions [] (get (json/read-json (:body (http-get "/_health"))) "sessions"))
 
 (deftest pages-and-assets
   (let [{:keys [status body]} (http-get "/")]
@@ -74,31 +107,68 @@
     (is (str/includes? body "<title>Counter</title>")))
   (is (= 302 (:status (http-get "/other"))))
   (is (= 200 (:status (http-get "/other/"))))
-  (is (str/includes? (:headers (http-get "/_dashboards/dashboards.js")) "javascript")
+  (is (str/includes? (get (:headers (http-get "/_dashboards/dashboards.js")) "content-type") "javascript")
       "assets are served")
+  (is (= 200 (:status (http-get "/_dashboards/datastar-1.0.4.js"))))
   (is (= 404 (:status (http-get "/_dashboards/nope.js"))))
-  (is (= "{\"status\":\"ok\",\"sessions\":0}" (:body (http-get "/_health")))))
+  (is (= 0 (sessions))))
 
-(deftest a-session-over-websocket
-  (let [c (connect "/_dashboards/ws")
-        hello (await-msg c #(= "hello" (:type %)))]
-    (is (string? (:session hello)))
-    (send-json c {:type "init" :inputs {:n 3}})
-    (is (str/includes? (:html (await-msg c #(= "output" (:type %)))) ">9<"))
-    (send-json c {:type "input" :id "n" :value 12})
-    (is (str/includes? (:html (await-msg c #(= "output" (:type %)))) ">144<"))
-    (is (str/includes? (:body (http-get "/_health")) "\"sessions\":1"))
+(deftest a-session-over-sse
+  (let [c (open-stream {"n" "3" "dsh" {"session" "" "kinds" {"n" "number"}}})
+        sid (session-of (await-event c connected?))]
+    (is (string? sid))
+    (is (str/includes? (get-in (await-event c (output-for "sq")) [:data "elements"]) ">9<"))
+
+    (testing "signals posted back update the session"
+      (is (= 204 (post-signals {"n" "12" "dsh" {"session" sid "kinds" {"n" "number"}}})))
+      (is (str/includes? (get-in (await-event c (output-for "sq")) [:data "elements"]) ">144<"))
+      (is (= 1 (sessions))))
 
     (testing "downloads go through the session"
-      (let [{:keys [status body headers]} (http-get (str "/_dashboards/download/" (:session hello) "/csv"))]
+      (let [{:keys [status body headers]} (http-get (str "/_dashboards/download/" sid "/csv"))]
         (is (= 200 status))
         (is (= "n\n12\n" body))
         (is (str/includes? (get headers "content-disposition") "n.csv"))))
     (is (= 404 (:status (http-get "/_dashboards/download/nope/csv"))))
 
-    (.join (.sendClose ^WebSocket (:ws c) WebSocket/NORMAL_CLOSURE "bye"))
-    (Thread/sleep 200)
-    (is (str/includes? (:body (http-get "/_health")) "\"sessions\":0"))))
+    (testing "a reconnecting browser resumes its session"
+      ((:close c))
+      (Thread/sleep 200)
+      (let [c2 (open-stream {"n" "12" "dsh" {"session" sid "kinds" {"n" "number"}}})]
+        (is (= sid (session-of (await-event c2 connected?))))
+        (is (str/includes? (get-in (await-event c2 (output-for "sq")) [:data "elements"]) ">144<")
+            "outputs are resent")
+        (is (= 1 (sessions)))
+        ((:close c2))))))
+
+(defn- post [path body]
+  (let [req (-> (HttpRequest/newBuilder (URI. (url path)))
+                (.POST (HttpRequest$BodyPublishers/ofString (json/write-json-str body)))
+                (.build))]
+    (.statusCode (.send ^HttpClient client req (HttpResponse$BodyHandlers/discarding)))))
+
+(deftest sessions-live-while-the-page-says-so
+  (let [s (start-server {:session-timeout-ms 400 :keep-alive-ms 50})]
+    (try
+      (binding [*server* s]
+        (testing "a heartbeat keeps a session alive; silence ends it"
+          (let [c (open-stream {"dsh" {"session" ""}})
+                sid (session-of (await-event c connected?))]
+            (dotimes [_ 4]
+              (Thread/sleep 200)
+              (is (= 204 (post "/_dashboards/alive" {"session" sid}))))
+            (is (= 1 (sessions)))
+            (Thread/sleep 800)
+            (is (= 0 (sessions)))
+            ((:close c))))
+        (testing "the close beacon ends a session at once"
+          (let [c (open-stream {"dsh" {"session" ""}})
+                sid (session-of (await-event c connected?))]
+            (is (= 1 (sessions)))
+            (is (= 204 (post "/_dashboards/close" {"session" sid})))
+            (is (= 0 (sessions)))
+            ((:close c)))))
+      (finally (server/stop! s)))))
 
 (deftest app-directories
   (let [root (.toFile (Files/createTempDirectory "dashboards" (make-array FileAttribute 0)))

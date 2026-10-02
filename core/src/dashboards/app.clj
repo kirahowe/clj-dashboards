@@ -11,7 +11,8 @@
   alongside other apps -- with the `dashboards.server` runtime. See the
   project README for deployment."
   (:require [clojure.java.io :as io]
-            [dashboards.html :as html]))
+            [dashboards.html :as html]
+            [dashboards.ui :as ui]))
 
 (defn app
   "Define an app.
@@ -40,9 +41,12 @@
 ;; ---------------------------------------------------------------------------
 ;; Client assets
 
+(def datastar-version "1.0.4")
+
 (def asset-names
-  "The browser assets the page loads, served from the classpath."
-  #{"dashboards.js" "dashboards.css"})
+  "The browser assets the page loads, served from the classpath.
+  `dashboards.js` imports Datastar itself."
+  #{"dashboards.js" "dashboards.css" (str "datastar-" datastar-version ".js")})
 
 (defn asset
   "The URL of a classpath client asset by file name, or nil."
@@ -56,21 +60,30 @@
      (hash (mapv #(some-> (asset %) slurp) (sort asset-names))))))
 
 (def assets-path
-  "Where the page expects the client assets and the websocket, relative
-  to the app's own URL."
+  "Where the page expects the client assets and endpoints, relative to
+  the app's own URL."
   "_dashboards")
 
 ;; ---------------------------------------------------------------------------
 ;; The page
 
+(def ^:private stream-options
+  ;; Keep the stream open in background tabs, as Shiny does, and keep
+  ;; trying to reconnect: a session survives a short disconnection.
+  "{openWhenHidden: true, retry: 'always', retryInterval: 500, retryMaxWait: 5000, retryMaxCount: 100000}")
+
 (defn page-html
   "The full HTML document for `app`. All URLs in it are relative, so
   the app works wherever it is mounted, including behind a proxy that
   serves it under a path prefix -- as long as the page URL ends in a
-  slash."
+  slash.
+
+  The page connects to the server with Datastar: the last element of
+  the body opens the session's event stream, and every change to a
+  signal (an input) is posted back, debounced."
   ^String [app request]
   (let [{:keys [ui title head]} app
-        body (if (fn? ui) (ui request) ui)
+        body (ui/expand (if (fn? ui) (ui request) ui))
         v @asset-version]
     (str "<!DOCTYPE html>\n"
          (html/hiccup->html
@@ -81,17 +94,26 @@
             [:title (or title "Dashboard")]
             [:link {:rel "icon" :href "data:,"}]
             [:link {:rel "stylesheet" :href (str assets-path "/dashboards.css?v=" v)}]
-            [:script {:defer true :src (str assets-path "/dashboards.js?v=" v)}]
+            [:script {:type "module" :src (str assets-path "/dashboards.js?v=" v)}]
             head]
-           [:body.dsh-body
+           [:body.dsh-body {:data-signals (html/js-literal {"dsh" {"session" "" "sizes" {} "kinds" {}}})}
             [:div.dsh-progress {:aria-hidden "true"}]
             body
-            [:div.dsh-notifications {:aria-live "polite"}]
+            [:div#dsh-notifications.dsh-notifications {:aria-live "polite"}]
             [:div.dsh-disconnected {:hidden true :role "alert"}
              [:div.dsh-disconnected-box
-              [:strong "Disconnected from the server."]
-              [:button.dsh-btn.dsh-btn-primary {:type "button" :onclick "location.reload()"}
-               "Reload"]]]]]))))
+              [:strong "Reconnecting to the server\u2026"]
+              [:button.dsh-btn.dsh-btn-secondary {:type "button" :onclick "location.reload()"}
+               "Reload"]]]
+            ;; Every signal change goes back to the server. Signals whose
+            ;; names start with an underscore stay in the browser.
+            [:div {:hidden true
+                   :data-on-signal-patch__debounce.100ms
+                   (str "@post('" assets-path "/signals', {retry: 'error', retryMaxCount: 3})")}]
+            ;; Last, so every input has declared its signal before the
+            ;; stream sends them all to start the session.
+            [:div#dsh-stream {:hidden true
+                              :data-init (str "@get('" assets-path "/stream', " stream-options ")")}]]]))))
 
 ;; ---------------------------------------------------------------------------
 ;; Files next to the app

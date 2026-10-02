@@ -11,7 +11,7 @@
 (defn hiccup->html
   "Render hiccup (or a seq of hiccup forms) to an HTML string."
   ^String [hiccup]
-  (str (h/html hiccup)))
+  (str (h/html {:mode :html} hiccup)))
 
 (defn raw
   "Mark a string as HTML that should be inserted without escaping."
@@ -35,6 +35,25 @@
   "The inverse of `id->str`."
   [s]
   (keyword s))
+
+(defn signal-name
+  "The Datastar signal that holds input `id`. Datastar camel-cases
+  signal names, so `:scatter-brush` is the signal `scatterBrush`, the
+  same signal `data-bind:scatter-brush` creates."
+  ^String [id]
+  (let [[head & more] (str/split (name id) #"-")]
+    (apply str head (map str/capitalize more))))
+
+(defn js-literal
+  "A Clojure value as a JavaScript literal (JSON), for Datastar
+  attribute expressions."
+  ^String [v]
+  (charred/write-json-str v))
+
+(defn id-selector
+  "A CSS selector for the element whose id is `id`."
+  ^String [id]
+  (str "#" (str/replace (id->str id) #"[^a-zA-Z0-9_-]" #(str "\\" %))))
 
 (defn encode-value
   "Encode a choice value for the browser. Values travel as EDN so a

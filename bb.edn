@@ -1,0 +1,49 @@
+;; Every script for working on clj-dashboards. `bb tasks` lists them.
+;; Tasks run the Clojure CLI (`clojure`), which must be installed.
+{:min-bb-version "1.3.0"
+ :paths ["bb"]
+ :tasks
+ {:requires ([babashka.fs :as fs]
+             [tasks])
+
+  test
+  {:doc "Run every test (core and server)"
+   :task (shell "clojure -X:test")}
+
+  test:core
+  {:doc "Run the core library's tests"
+   :task (shell {:dir "core"} "clojure -X:test")}
+
+  test:server
+  {:doc "Run the server's tests"
+   :task (shell {:dir "server"} "clojure -X:test")}
+
+  examples
+  {:doc "Serve the example apps at http://localhost:8080/ (extra args go to the server, e.g. --port 3000)"
+   :task (apply shell "clojure -M:examples" *command-line-args*)}
+
+  serve
+  {:doc "Run the dashboards server, e.g. bb serve --app examples/apps/hello (bb serve --help)"
+   :task (apply shell "clojure -M:serve" *command-line-args*)}
+
+  docker:build
+  {:doc "Build the server image, clj-dashboards (deploy/Dockerfile)"
+   :task (shell "docker build -f deploy/Dockerfile -t clj-dashboards .")}
+
+  docker:run
+  {:doc "Run the server image with the examples mounted, at http://localhost:8080/"
+   :task (shell "docker run --rm -p 8080:8080"
+                "-v" (str (fs/absolutize "examples/apps") ":/srv/dashboards:ro")
+                "clj-dashboards")}
+
+  template:uber
+  {:doc "Build the starter template's uberjar against this checkout"
+   :task (shell {:dir "template"} "clojure -T:build uber :aliases '[:in-repo]'")}
+
+  datastar:update
+  {:doc "Vendor a Datastar release into core: bb datastar:update 1.0.5"
+   :task (tasks/datastar-update (first *command-line-args*))}
+
+  clean
+  {:doc "Remove build output and caches"
+   :task (tasks/clean)}}}

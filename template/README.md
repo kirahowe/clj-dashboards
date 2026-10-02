@@ -4,17 +4,25 @@ A starting point for a dashboard of your own, built with
 [clj-dashboards](https://github.com/kirahowe/clj-dashboards).
 
 1. Copy this directory. The `:git/sha` entries in `deps.edn` pin the
-   clj-dashboards version; point them at a newer commit to upgrade.
+   clj-dashboards version; `bb upgrade` moves them to the latest commit.
 2. Edit `src/my_dashboard/app.clj`. Data goes in `resources/`.
-3. Develop at the REPL: `clj -M:dev`, then `(go)`, then open
+3. Develop at the REPL: `bb repl`, then `(go)`, then open
    http://localhost:8080/. Re-evaluate your code and reload the page.
+
+You need the [Clojure CLI](https://clojure.org/guides/install_clojure)
+and [Babashka](https://babashka.org) (`bb tasks` lists the tasks).
 
 | | |
 |---|---|
-| `clojure -M:run` | serve the app on port 8080 (`PORT` changes it) |
-| `clojure -T:build uber` | build `target/my-dashboard.jar` |
+| `bb run` | serve the app on port 8080 (`PORT` changes it) |
+| `bb repl` | a REPL with `(go)` and `(stop)` |
+| `bb uber` | build `target/my-dashboard.jar` |
 | `java -jar target/my-dashboard.jar --app my-dashboard.app/app` | run the jar |
-| `docker build -t my-dashboard .` | build a container image (JRE only) |
+| `bb docker` | build a container image (JRE only) |
+| `bb upgrade` | move to the latest clj-dashboards |
 
 The container listens on port 8080. Point health checks at `/_health`.
-If you put it behind a proxy, make sure the proxy forwards websockets.
+The browser talks to the app over plain HTTP: one long-lived
+server-sent event stream per tab, plus small POSTs. Any proxy that
+streams responses works; turn off response buffering for
+`_dashboards/stream` if yours buffers.

@@ -1,6 +1,17 @@
 (ns dashboards.server
-  "Hosting for dashboards apps: HTTP pages, the websocket that carries
-  each session, client assets, downloads and static files.
+  "Hosting for dashboards apps: HTTP pages, the server-sent event
+  stream that carries each session, client assets, downloads and
+  static files.
+
+  Each browser tab opens one long-lived SSE stream (`GET
+  _dashboards/stream`), which starts its session, and posts its
+  Datastar signals back whenever they change (`POST
+  _dashboards/signals`). Both are plain HTTP, so any proxy that can
+  stream a response can sit in front. If the stream drops, the browser
+  reconnects and picks up the same session. While the page is open it
+  sends a small heartbeat; a session the server has not heard from in
+  `:session-timeout-ms` ends, as does one whose page sends its close
+  beacon on the way out.
 
   Apps don't depend on this namespace; it is the infrastructure that
   runs them, like Shiny Server is for Shiny apps. Use it three ways:
@@ -17,12 +28,14 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [dashboards.app :as app]
+            [dashboards.datastar :as datastar]
             [dashboards.html :as html]
             [dashboards.server.apps :as apps]
             [dashboards.session :as session]
             [org.httpkit.server :as http])
   (:import (java.io File)
            (java.net URLDecoder URLEncoder)
+           (java.util.concurrent Executors ScheduledExecutorService TimeUnit)
            (java.time LocalDateTime)
            (java.time.format DateTimeFormatter)))
 
@@ -71,55 +84,125 @@
          :body f}))))
 
 ;; ---------------------------------------------------------------------------
-;; Sessions
+;; Sessions over SSE
 
 (defn- session-count [server-state] (count @(:sessions server-state)))
 
-(defn- websocket [server-state mount req]
-  (if-not (:websocket? req)
-    (text 400 "Expected a websocket request.")
-    (let [{:keys [max-sessions sanitize-errors?]} (:config server-state)]
+(defn- query-param [req k]
+  (some (fn [pair]
+          (let [[pk v] (str/split pair #"=" 2)]
+            (when (= k (url-decode pk)) (url-decode (or v "")))))
+        (some-> (:query-string req) (str/split #"&"))))
+
+(defn- body-string [req]
+  (some-> (:body req) slurp))
+
+(def ^:private sse-headers
+  {"Content-Type" "text/event-stream"
+   "Cache-Control" "no-cache, no-transform"
+   "X-Accel-Buffering" "no"})
+
+(defn- now [] (System/currentTimeMillis))
+
+(defn- end-session!
+  "Forget session `sid` and stop it."
+  [server-state sid]
+  (let [[old _] (swap-vals! (:sessions server-state) dissoc sid)]
+    (when-let [{:keys [session channel]} (get old sid)]
+      (swap! (:channels server-state) dissoc channel)
+      (session/close! session))))
+
+(defn- touch!
+  "Note that the browser behind session `sid` is still there."
+  [server-state sid]
+  (swap! (:sessions server-state)
+         (fn [m] (if (contains? m sid) (assoc-in m [sid :seen] (now)) m))))
+
+(defn- attach!
+  "Point session `s` at the stream `ch` (replacing any earlier one)."
+  [server-state s ch]
+  (let [sid (:id s)
+        [old _] (swap-vals! (:sessions server-state) assoc sid {:session s :channel ch :seen (now)})]
+    (when-let [old-ch (get-in old [sid :channel])]
+      (swap! (:channels server-state) dissoc old-ch))
+    (swap! (:channels server-state) assoc ch sid)
+    (session/set-transport! s (fn [msg] (http/send! ch (datastar/event msg) false)))))
+
+(defn- housekeeping!
+  "Run periodically: comment on every stream so proxies keep idle ones
+  open, and end sessions whose browser has not been heard from (by
+  heartbeat, signals or a reconnecting stream) within the timeout."
+  [server-state]
+  (doseq [ch (keys @(:channels server-state))]
+    (http/send! ch datastar/keep-alive false))
+  (let [cutoff (- (now) (:session-timeout-ms (:config server-state)))]
+    (doseq [[sid {:keys [seen]}] @(:sessions server-state)
+            :when (< seen cutoff)]
+      (end-session! server-state sid))))
+
+(defn- stream
+  "The session's event stream. Opening it starts a session -- or
+  resumes the one named in the signals, after a reconnect."
+  [server-state mount req]
+  (let [{:keys [max-sessions sanitize-errors?]} (:config server-state)
+        signals (try (datastar/read-signals (query-param req "datastar"))
+                     (catch Exception _ {}))
+        sid (get-in signals ["dsh" "session"])
+        existing (some-> (get @(:sessions server-state) sid) :session)]
+    (cond
+      (and (nil? existing) max-sessions (>= (session-count server-state) max-sessions))
+      {:status 503 :headers {"Content-Type" "text/plain"} :body "At capacity"}
+
+      :else
       (http/as-channel
        req
        {:on-open
         (fn [ch]
-          (if (and max-sessions (>= (session-count server-state) max-sessions))
-            (do (http/send! ch (json/write-json-str
-                                {:type "notification" :level "error" :duration nil
-                                 :message "This server is at capacity. Please try again later."}))
-                (http/close ch))
-            (try
-              (let [the-app (apps/resolve-app (:source mount))
-                    s (session/start! the-app
-                                      {:send! (fn [msg] (http/send! ch (json/write-json-str msg)))
-                                       :request (dissoc req :async-channel :body)
-                                       :sanitize-errors? sanitize-errors?})]
-                (swap! (:sessions server-state) assoc (:id s) s)
-                (swap! (:channels server-state) assoc ch (:id s)))
-              (catch Throwable t
-                (log "failed to start session for" (:path mount) "-" (ex-message t))
-                (http/send! ch (json/write-json-str
-                                {:type "notification" :level "error" :duration nil
-                                 :message (str "The app could not start: "
-                                               (if sanitize-errors? "see the server log." (ex-message t)))}))
-                (http/close ch)))))
-        :on-receive
-        (fn [ch data]
-          (when-let [sid (get @(:channels server-state) ch)]
-            (when-let [s (get @(:sessions server-state) sid)]
-              (try (session/receive! s (json/read-json data :key-fn keyword))
-                   (catch Exception e
-                     (log "bad message from session" sid "-" (ex-message e)))))))
+          (http/send! ch {:status 200 :headers sse-headers} false)
+          (try
+            (let [s (or (when (and existing (not (session/closed? existing))) existing)
+                        (session/start! (apps/resolve-app (:source mount))
+                                        {:request (dissoc req :async-channel :body)
+                                         :sanitize-errors? sanitize-errors?}))]
+              (attach! server-state s ch)
+              (session/connected! s)
+              (session/receive! s signals))
+            (catch Throwable t
+              (log "failed to start session for" (:path mount) "-" (ex-message t))
+              (http/send! ch (datastar/event
+                              {:type "notification" :level "error" :duration nil
+                               :message (str "The app could not start: "
+                                             (if sanitize-errors? "see the server log." (ex-message t)))})
+                          false))))
+        ;; Not every server reports a client going away from a
+        ;; streaming response, so the session isn't ended here: the
+        ;; browser's heartbeat and close beacon decide (see
+        ;; `housekeeping!`).
         :on-close
         (fn [ch _status]
           (when-let [sid (get @(:channels server-state) ch)]
             (swap! (:channels server-state) dissoc ch)
-            (when-let [s (get @(:sessions server-state) sid)]
-              (swap! (:sessions server-state) dissoc sid)
-              (session/close! s))))}))))
+            (when-let [s (get-in @(:sessions server-state) [sid :session])]
+              (when (= ch (get-in @(:sessions server-state) [sid :channel]))
+                (session/set-transport! s nil)))))}))))
+
+(defn- read-body [req]
+  (try (datastar/read-signals (body-string req)) (catch Exception _ nil)))
+
+(def ^:private no-content {:status 204 :body ""})
+
+(defn- receive-signals
+  "A POST of the page's signals, after one of them changed."
+  [server-state req]
+  (let [signals (read-body req)
+        sid (get-in signals ["dsh" "session"])]
+    (when-let [s (some-> (get @(:sessions server-state) sid) :session)]
+      (touch! server-state sid)
+      (session/receive! s signals))
+    no-content))
 
 (defn- download [server-state sid id]
-  (if-let [s (get @(:sessions server-state) sid)]
+  (if-let [s (some-> (get @(:sessions server-state) sid) :session)]
     (if-let [{:keys [filename content-type body]} (session/download! s id)]
       {:status 200
        :headers {"Content-Type" content-type
@@ -144,8 +227,18 @@
     (let [the-app (apps/resolve-app (:source mount))]
       (html-response (app/page-html the-app req)))
 
-    (= sub "_dashboards/ws")
-    (websocket server-state mount req)
+    (= sub "_dashboards/stream")
+    (stream server-state mount req)
+
+    (contains? #{"_dashboards/signals" "_dashboards/alive" "_dashboards/close"} sub)
+    (if (not= :post (:request-method req))
+      (text 405 "POST here.")
+      (case sub
+        "_dashboards/signals" (receive-signals server-state req)
+        ;; The browser's heartbeat, while the page is open...
+        "_dashboards/alive" (do (touch! server-state (get (read-body req) "session")) no-content)
+        ;; ...and its goodbye, sent as the page goes away.
+        "_dashboards/close" (do (end-session! server-state (get (read-body req) "session")) no-content)))
 
     (str/starts-with? sub "_dashboards/download/")
     (let [[sid id] (str/split (subs sub (count "_dashboards/download/")) #"/" 2)]
@@ -279,9 +372,18 @@
   - `:base-path` -- a path prefix the server sees in front of every
     URL, when a proxy forwards `/dashboards/...` without stripping it.
   - `:max-sessions` -- refuse new sessions beyond this many.
+  - `:session-timeout-ms` -- end a session after this long without
+    word from its browser (default 120000). Pages send a heartbeat
+    every 20s, but browsers slow timers in background tabs to once a
+    minute, so keep it well above that.
+  - `:keep-alive-ms` -- how often idle streams get a comment, so that
+    proxies keep them open, and timed-out sessions are ended (default
+    20000).
   - `:sanitize-errors?` -- don't show exception messages to users."
   [config]
-  (let [config (merge {:port 8080 :host "0.0.0.0" :reload? true} config)
+  (let [config (merge {:port 8080 :host "0.0.0.0" :reload? true
+                       :session-timeout-ms 120000 :keep-alive-ms 20000}
+                      (into {} (remove (comp nil? val)) config))
         static-mounts (vec (for [{:keys [path app]} (:apps config)]
                              {:path (normalize-path (or path "/"))
                               :source (apps/->source app :reload? (:reload? config))}))
@@ -289,7 +391,13 @@
                :static-mounts static-mounts
                :dir-sources (atom {})
                :sessions (atom {})
-               :channels (atom {})}
+               :channels (atom {})
+               :scheduler (Executors/newSingleThreadScheduledExecutor)}
+        _ (.scheduleAtFixedRate ^ScheduledExecutorService (:scheduler state)
+                                ^Runnable #(try (housekeeping! state)
+                                               (catch Throwable t (log "housekeeping failed:" (ex-message t))))
+                                (long (:keep-alive-ms config)) (long (:keep-alive-ms config))
+                                TimeUnit/MILLISECONDS)
         stop-fn (http/run-server (handler state)
                                  {:port (:port config)
                                   :ip (:host config)
@@ -302,8 +410,9 @@
 (defn stop!
   "Stop a server started with `start!`, ending its sessions."
   [server]
-  (doseq [s (vals @(:sessions server))]
-    (session/close! s))
+  (.shutdownNow ^ScheduledExecutorService (:scheduler server))
+  (doseq [{:keys [session]} (vals @(:sessions server))]
+    (session/close! session))
   (reset! (:sessions server) {})
   @(http/server-stop! (:http server) {:timeout 1000})
   nil)

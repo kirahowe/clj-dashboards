@@ -2,28 +2,28 @@
   "One browser tab's connection to an app.
 
   A session owns the tab's inputs, runs the app's server function once,
-  and keeps the outputs it returns up to date. It speaks a small
-  message protocol but knows nothing about how messages travel: the
-  hosting layer (see the `dashboards.server` module) hands it a
-  `send!` function and feeds it what the browser sends with
-  `receive!`. That separation is what lets the same app run under the
-  bundled server, inside a test, or behind any other transport.
+  and keeps the outputs it returns up to date. It knows nothing about
+  how messages travel: the hosting layer (see the `dashboards.server`
+  module) hands it a `send!` function and feeds it what the browser
+  sends with `receive!`. That separation is what lets the same app run
+  under the bundled server, inside a test, or behind any other
+  transport. `dashboards.datastar` turns the messages into the
+  Datastar SSE events the browser understands.
 
-  Messages are maps. From the browser:
+  **From the browser** come Datastar signal snapshots: a map of every
+  signal on the page, string keys, as Datastar sends them. Each
+  top-level signal is an input, except `dsh`, which carries the
+  session id, how to decode each input (`dsh.kinds`) and the measured
+  size of each plot (`dsh.sizes`).
 
-      {:type \"init\"   :inputs {id value ...}}
-      {:type \"input\"  :id \"n\" :value 10 :kind \"edn\"|\"date\"|nil}
-      {:type \"inputs\" :inputs {id value ...} :kinds {id kind}}
-      {:type \"bind\"   :outputs [\"plot\" ...]}   ; resend these outputs
-      {:type \"ping\"}
+  **To the browser** go message maps:
 
-  To the browser:
-
-      {:type \"hello\" :session \"<id>\"}
-      {:type \"output\" :id \"plot\" :html \"...\" :status \"ok\"|\"empty\"|\"validation\"|\"error\" :message \"...\"}
+      {:type \"connected\" :session \"<id>\"}
+      {:type \"output\" :id \"plot\" :html \"...\" :status \"ok\"|\"empty\"|\"validation\"|\"error\"}
       {:type \"recalculating\" :id \"plot\"}
       {:type \"busy\"} {:type \"idle\"}
-      {:type \"update-input\" :id \"x\" :props {...}}
+      {:type \"signals\" :signals {...}}
+      {:type \"choices\" :id \"x\" :signal \"x\" :choices [...] :selected ...}
       {:type \"notification\" :message \"...\" :level \"info\" :duration 5000}"
   (:require [clojure.string :as str]
             [dashboards.html :as html]
@@ -42,16 +42,17 @@
 
 ;; ---------------------------------------------------------------------------
 ;; Inputs
+;;
+;; Each input is a reactive value, keyed by its Datastar signal name.
 
-(defn- name-or-str [id] (if (keyword? id) (html/id->str id) (str id)))
+(defn- cell
+  "The reactive value under `k` in the atom `cells`, created on first use."
+  [cells k]
+  (or (get @cells k)
+      (get (swap! cells (fn [m] (if (contains? m k) m (assoc m k (r/value nil :label k))))) k)))
 
-(defn- input-cell
-  "The reactive value holding input `id`, created on first use."
-  [session id]
-  (let [inputs (:inputs session)]
-    (or (get @inputs id)
-        (get (swap! inputs (fn [m] (if (contains? m id) m (assoc m id (r/value nil :label id)))))
-             id))))
+(defn- input-cell [session id]
+  (cell (:inputs session) (if (string? id) id (html/signal-name id))))
 
 (deftype Input [session]
   clojure.lang.IFn
@@ -68,26 +69,61 @@
   ([] (input nil))
   ([session] (->Input (current session))))
 
-(defn- decode-input [kind v]
+(defn- keywordize [v]
+  (cond (map? v) (into {} (map (fn [[k x]] [(keyword k) (keywordize x)])) v)
+        (sequential? v) (mapv keywordize v)
+        :else v))
+
+(defn- decode-input
+  "Turn a signal's JSON value into the input's Clojure value, as its
+  kind (declared by the component that made it) says."
+  [kind v]
   (case kind
-    "edn" (if (sequential? v) (mapv html/decode-value v) (html/decode-value v))
+    "edn" (if (sequential? v)
+            (into [] (comp (remove #(= "" %)) (map html/decode-value)) v)
+            (html/decode-value v))
+    "number" (cond (number? v) v
+                   (and (string? v) (not (str/blank? v)))
+                   (or (parse-long (str/trim v)) (parse-double (str/trim v)))
+                   :else nil)
     "date" (when (and (string? v) (not (str/blank? v)))
              (try (LocalDate/parse v) (catch Exception _ nil)))
-    (if (sequential? v) (vec v) v)))
+    "action" (when (and (number? v) (pos? v)) v)
+    (keywordize v)))
 
-(defn- set-input! [session id kind v]
-  (reset! (input-cell session (html/str->id (name-or-str id))) (decode-input kind v)))
-
+(defn- encode-input
+  "The inverse of `decode-input`, for values the server sets."
+  [kind v]
+  (case kind
+    "edn" (if (sequential? v) (mapv html/encode-value v) (html/encode-value v))
+    ("number" "date") (if (nil? v) "" (str v))
+    "action" (or v 0)
+    (cond (keyword? v) (html/encode-value v)
+          (instance? LocalDate v) (str v)
+          :else v)))
 
 (defn client-size
   "The measured size `[width height]` of output `id` in the browser, or
   nil before it has been measured. Reactive."
   [session id]
-  (let [in (->Input session)
-        w (in (keyword "clientdata" (str "output-" (html/id->str id) "-width")))
-        h (in (keyword "clientdata" (str "output-" (html/id->str id) "-height")))]
-    (when (and (number? w) (number? h) (pos? w) (pos? h))
-      [w h])))
+  @(cell (:sizes session) (html/id->str id)))
+
+(defn- set-signals!
+  "Apply a snapshot of the page's signals. Inputs missing from the
+  snapshot (a brush that was cleared, say) become nil."
+  [session signals]
+  (let [{:strs [dsh]} signals
+        kinds (get dsh "kinds" {})
+        inputs (dissoc signals "dsh")]
+    (reset! (:kinds session) kinds)
+    (doseq [[id size] (get dsh "sizes")]
+      (when (and (sequential? size) (= 2 (count size)) (every? pos? size))
+        (reset! (cell (:sizes session) id) (vec size))))
+    (doseq [[k v] inputs]
+      (reset! (input-cell session k) (decode-input (get kinds k) v)))
+    (doseq [[k c] @(:inputs session)
+            :when (not (contains? inputs k))]
+      (reset! c nil))))
 
 ;; ---------------------------------------------------------------------------
 ;; Sending
@@ -95,7 +131,7 @@
 (defn send!
   "Send a message map to the session's browser."
   [session msg]
-  (try ((:send! session) msg)
+  (try (@(:transport session) msg)
        (catch Throwable t
          (binding [*out* *err*]
            (println "dashboards: failed to send to session" (:id session) "-" (ex-message t))))))
@@ -111,22 +147,32 @@
                              :level (name level) :duration duration})))
 
 (defn update-input!
-  "Change an input in the browser. `props` may hold `:value`, `:label`,
-  `:choices` (for selects, radio buttons and checkbox groups, in any
-  form `ui/select-input` accepts), `:selected`, `:min`, `:max`, `:step`.
-  The input's new value comes back to the server as usual.
+  "Change an input in the browser.
+
+  - `:value` sets the input's value.
+  - `:choices` replaces the choices of a select, radio buttons or
+    checkbox group (in any form `ui/select-input` accepts), with
+    `:selected` saying which are chosen.
 
       (update-input! :y {:choices numeric-columns :selected :body-mass})"
   ([id props] (update-input! nil id props))
-  ([session id props]
-   (let [encode (fn [v] (if (coll? v) (mapv html/encode-value v) (html/encode-value v)))
-         props (cond-> props
-                 (:choices props) (update :choices #(mapv (fn [{:keys [value label]}]
-                                                            {:value (html/encode-value value) :label label})
-                                                          (html/normalize-choices %)))
-                 (contains? props :selected) (update :selected encode)
-                 (some? (:value props)) (update :value #(if (instance? LocalDate %) (str %) %)))]
-     (send! (current session) {:type "update-input" :id (name-or-str id) :props props}))))
+  ([session id {:keys [value choices selected] :as props}]
+   (let [session (current session)
+         signal (html/signal-name id)
+         kind (get @(:kinds session) signal)]
+     (if choices
+       (send! session {:type "choices"
+                       :id (html/id->str id)
+                       :signal signal
+                       :choices (mapv (fn [{:keys [value label]}]
+                                        {:value (html/encode-value value) :label (str label)})
+                                      (html/normalize-choices choices))
+                       :selected (when (contains? props :selected)
+                                   (if (sequential? selected)
+                                     (mapv html/encode-value selected)
+                                     (html/encode-value selected)))})
+       (when (contains? props :value)
+         (send! session {:type "signals" :signals {signal (encode-input kind value)}}))))))
 
 (defn on-ended
   "Call `f` when the session ends (the tab closes or disconnects)."
@@ -158,19 +204,21 @@
     (when-let [c (ex-cause t)] (println "  caused by:" (ex-message c)))))
 
 (defn- render-message [session id spec]
-  (let [id-str (html/id->str id)]
+  (let [id-str (html/id->str id)
+        msg (fn [status html] {:type "output" :id id-str :status status :html html})]
     (try
-      (let [html (binding [render/*size* (client-size session id)]
-                   (render/run spec))]
-        {:type "output" :id id-str :html html :status (if (str/blank? html) "empty" "ok")})
+      (let [out (binding [render/*size* (client-size session id)]
+                  (render/run spec))]
+        (msg (if (str/blank? out) "empty" "ok") out))
       (catch Throwable t
         (cond
-          (r/silent? t) {:type "output" :id id-str :html "" :status "empty"}
-          (r/validation? t) {:type "output" :id id-str :html "" :status "validation"
-                             :message (ex-message t)}
+          (r/silent? t) (msg "empty" "")
+          (r/validation? t) (msg "validation"
+                                 (html/hiccup->html [:div.dsh-output-validation (ex-message t)]))
           :else (do (log-error session (str "output " id-str) t)
-                    {:type "output" :id id-str :html "" :status "error"
-                     :message (error-message session t)}))))))
+                    (msg "error"
+                         (html/hiccup->html [:div.dsh-output-error [:strong "Error"] " "
+                                             (error-message session t)]))))))))
 
 (defn- add-output! [session id spec]
   (when-not (render/spec? spec)
@@ -214,76 +262,67 @@
   - `:sanitize-errors?` -- show a generic message instead of exception
                   messages in outputs (for production).
 
-  The server function runs once the browser's `init` message arrives."
-  [app {:keys [send! request id sanitize-errors?]}]
+  The server function runs when the first signal snapshot arrives."
+  [app {transport :send! :keys [request id sanitize-errors?]}]
   (let [id (or id (str (UUID/randomUUID)))
         session-p (promise)
+        send-msg! (fn [msg] (send! @session-p msg))
         domain (r/domain :label (str "session " id)
                          :bindings (fn [] {#'*session* @session-p})
-                         :on-busy #(send! {:type "busy"})
-                         :on-idle #(send! {:type "idle"})
+                         :on-busy #(send-msg! {:type "busy"})
+                         :on-idle #(send-msg! {:type "idle"})
                          :on-error (fn [obs t]
                                      (log-error @session-p (or (:label obs) "observer") t)
-                                     (send! {:type "notification" :level "error" :duration nil
-                                             :message (str "Error: " (error-message @session-p t))})))
+                                     (send-msg! {:type "notification" :level "error" :duration nil
+                                                 :message (str "Error: " (error-message @session-p t))})))
         session {:id id
                  :app app
-                 :send! send!
+                 :transport (atom (or transport (fn [_])))
                  :request request
                  :sanitize-errors? sanitize-errors?
                  :domain domain
                  :inputs (atom {})
+                 :sizes (atom {})
+                 :kinds (atom {})
                  :outputs (atom {})
                  :downloads (atom {})
                  :on-ended (atom [])
                  :started (atom false)}]
     (deliver session-p session)
-    (send! {:type "hello" :session id})
     session))
 
-(defn- handle! [session {:keys [type] :as msg}]
-  (case type
-    "init"
-    (do (doseq [[id v] (:inputs msg)]
-          (set-input! session id (get-in msg [:kinds id]) v))
-        (when (compare-and-set! (:started session) false true)
-          (try (start-server-fn! session)
-               (catch Throwable t
-                 (log-error session "server function" t)
-                 (send! session {:type "notification" :level "error" :duration nil
-                                 :message (str "The app failed to start: " (error-message session t))})))))
+(defn set-transport!
+  "Send through `send!` from now on (after the browser reconnects,
+  say). Pass nil to drop messages while no browser is connected."
+  [session send!]
+  (reset! (:transport session) (or send! (fn [_]))))
 
-    "input"
-    (set-input! session (:id msg) (:kind msg) (:value msg))
-
-    "inputs"
-    (doseq [[id v] (:inputs msg)]
-      (set-input! session id (get-in msg [:kinds id]) v))
-
-    "bind"
-    (doseq [id (:outputs msg)]
-      (when-let [m (get @(:outputs session) (str id))]
-        (send! session m)))
-
-    "ping" nil
-
-    (binding [*out* *err*]
-      (println "dashboards: unknown message type" (pr-str type)))))
-
-(defn- keywordize-map-keys
-  "Input ids arrive from JSON as keys; keep them as strings."
-  [m]
-  (into {} (map (fn [[k v]] [(name-or-str k) v])) m))
+(defn connected!
+  "Tell the browser which session it is talking to, and send every
+  output it may have missed. Call it whenever a stream (re)opens."
+  [session]
+  (r/submit! (:domain session)
+             (fn []
+               (send! session {:type "connected" :session (:id session)})
+               (doseq [msg (vals @(:outputs session))]
+                 (send! session msg)))))
 
 (defn receive!
-  "Handle a message from the browser. `msg` is a map with keyword keys
-  at the top level (as parsed from JSON). Processing happens on the
-  session's thread; this returns immediately."
-  [session msg]
-  (let [msg (cond-> msg
-              (:inputs msg) (update :inputs keywordize-map-keys)
-              (:kinds msg) (update :kinds keywordize-map-keys))]
-    (r/submit! (:domain session) #(handle! session msg))))
+  "Apply a snapshot of the browser's signals (a map with string keys,
+  as parsed from Datastar's JSON). The first snapshot starts the
+  server function. Processing happens on the session's thread; this
+  returns immediately."
+  [session signals]
+  (r/submit! (:domain session)
+             (fn []
+               (set-signals! session signals)
+               (when (compare-and-set! (:started session) false true)
+                 (try (start-server-fn! session)
+                      (catch Throwable t
+                        (log-error session "server function" t)
+                        (send! session {:type "notification" :level "error" :duration nil
+                                        :message (str "The app failed to start: "
+                                                      (error-message session t))})))))))
 
 (defn download!
   "Produce the download `id` for this session: `{:filename
@@ -293,6 +332,8 @@
   (when-let [spec (get @(:downloads session) (str id))]
     (r/submit-sync! (:domain session)
                     #(r/isolate (render/download-content spec)))))
+
+(defn closed? [session] (r/closed? (:domain session)))
 
 (defn close!
   "End the session: run its `on-ended` callbacks and stop its

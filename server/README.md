@@ -1,9 +1,13 @@
 # dashboards-server
 
 The hosting runtime for dashboards apps, the counterpart of Shiny Server.
-It's an http-kit server that runs each browser tab as a websocket session
-and serves client assets, downloads and each app's `www/` files. It also
-has a `/_health` endpoint.
+It's an http-kit server that runs each browser tab's session over a
+server-sent event stream (with the page posting its Datastar signals
+back), and serves client assets, downloads and each app's `www/` files.
+It also has a `/_health` endpoint.
+
+From this repository, `bb serve` runs the CLI below with the examples
+on the classpath.
 
 ```sh
 clojure -M -m dashboards.server.main --help

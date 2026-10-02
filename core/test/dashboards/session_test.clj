@@ -38,12 +38,16 @@
                  :table (render/table ds)
                  :file (render/download {:filename "data.csv"} ds)}))}))
 
+(defn- signals [m] (merge {"dsh" {"session" "" "sizes" {} "kinds" {}}} m))
+
 (deftest session-lifecycle
   (let [{:keys [session sent] :as t} (start test-app)]
-    (is (= {:type "hello" :session (:id session)} (first @sent)))
+    (session/connected! session)
+    (settle! t)
+    (is (= {:type "connected" :session (:id session)} (first @sent)))
 
-    (testing "outputs render once the browser sends its inputs"
-      (session/receive! session {:type "init" :inputs {"n" 2 "choice" ":b"} :kinds {"choice" "edn"}})
+    (testing "outputs render once the browser sends its signals"
+      (session/receive! session (signals {"n" 2 "choice" ":b" "dsh" {"kinds" {"choice" "edn"}}}))
       (settle! t)
       (is (str/includes? (:html (last-output sent "doubled")) ">4<"))
       (is (str/includes? (:html (last-output sent "choice")) ":b")
@@ -51,7 +55,7 @@
 
     (testing "changing an input re-renders what depends on it, and only that"
       (let [plot-renders (count (outputs sent "plot"))]
-        (session/receive! session {:type "input" :id "n" :value 5})
+        (session/receive! session (signals {"n" 5 "choice" ":b" "dsh" {"kinds" {"choice" "edn"}}}))
         (settle! t)
         (is (str/includes? (:html (last-output sent "doubled")) ">10<"))
         (is (some #(= {:type "recalculating" :id "doubled"} %) @sent))
@@ -59,30 +63,33 @@
 
     (testing "req, validate and errors"
       (is (= "empty" (:status (last-output sent "needs"))))
-      (is (= {:status "validation" :message "Not OK yet"}
-             (select-keys (last-output sent "checked") [:status :message])))
-      (session/receive! session {:type "input" :id "ok" :value true})
+      (is (= "validation" (:status (last-output sent "checked"))))
+      (is (str/includes? (:html (last-output sent "checked")) "Not OK yet"))
+      (session/receive! session (signals {"n" 5 "ok" true}))
       (settle! t)
       (is (= "ok" (:status (last-output sent "checked"))))
-      (is (= {:status "error" :message "kaboom"}
-             (select-keys (last-output sent "broken") [:status :message]))))
+      (is (= "error" (:status (last-output sent "broken"))))
+      (is (str/includes? (:html (last-output sent "broken")) "kaboom")))
+
+    (testing "inputs missing from a snapshot become nil"
+      (is (str/includes? (:html (last-output sent "choice")) "nil")))
 
     (testing "plots and tables"
       (is (str/starts-with? (:html (last-output sent "plot")) "<svg"))
       (is (str/includes? (:html (last-output sent "table")) "<table")))
 
     (testing "plots are sized to their element"
-      (session/receive! session {:type "inputs" :inputs {"clientdata/output-plot-width" 500
-                                                         "clientdata/output-plot-height" 300}})
+      (session/receive! session (signals {"n" 5 "ok" true "dsh" {"sizes" {"plot" [500 300]}}}))
       (settle! t)
       (is (str/includes? (:html (last-output sent "plot")) "width=\"500\"")))
 
-    (testing "bind resends cached outputs"
-      (let [n (count @sent)]
-        (session/receive! session {:type "bind" :outputs ["doubled"]})
-        (settle! t)
-        (is (= (last-output sent "doubled") (last @sent)))
-        (is (= (inc n) (count @sent)))))
+    (testing "connected! resends every output, for a browser that reconnected"
+      (reset! sent [])
+      (session/connected! session)
+      (settle! t)
+      (is (= "connected" (:type (first @sent))))
+      (is (= #{"doubled" "choice" "needs" "checked" "broken" "plot" "table"}
+             (set (keep :id (rest @sent))))))
 
     (testing "downloads"
       (let [{:keys [filename content-type body]} (session/download! session "file")]
@@ -96,28 +103,49 @@
         (session/close! session)
         (is @ended)
         (let [n (count @sent)]
-          (session/receive! session {:type "input" :id "n" :value 7})
+          (session/receive! session (signals {"n" 7}))
           (Thread/sleep 50)
           (is (= n (count @sent))))))))
+
+(deftest decoding-inputs-by-kind
+  (let [seen (atom nil)
+        a (app/app {:ui [:div]
+                    :server (fn [{:keys [input]}]
+                              (r/observe (reset! seen (mapv input [:species :n :empty :day :go :raw :scatter-brush])))
+                              nil)})
+        {:keys [session] :as t} (start a)]
+    (session/receive! session (signals {"species" [":adelie" "" ":gentoo"] "n" "12" "empty" ""
+                                        "day" "2024-03-01" "go" 0 "raw" {"a" [1 {"b" 2}]}
+                                        "scatterBrush" [3 4]
+                                        "dsh" {"kinds" {"species" "edn" "n" "number" "empty" "number"
+                                                        "day" "date" "go" "action"}}}))
+    (settle! t)
+    (is (= [[:adelie :gentoo] 12 nil (java.time.LocalDate/of 2024 3 1) nil {:a [1 {:b 2}]} [3 4]]
+           @seen)
+        "checkbox slots drop unchecked entries; numbers parse; actions start at nil; kebab ids read camelCase signals")))
 
 (deftest server-functions-must-return-render-specs
   (let [{:keys [session sent] :as t}
         (start (app/app {:ui [:div] :server (fn [_] {:oops 42})}))]
-    (session/receive! session {:type "init" :inputs {}})
+    (session/receive! session (signals {}))
     (settle! t)
     (is (some #(and (= "notification" (:type %))
                     (str/includes? (:message %) "not a render spec"))
               @sent))))
 
-(deftest update-input-encodes-choices
+(deftest update-input-encodes-values
   (let [{:keys [session sent] :as t}
         (start (app/app {:ui [:div]
                          :server (fn [_]
                                    (session/update-input! :col {:choices [:a :b] :selected :b})
+                                   (session/update-input! :x-col {:value :c})
+                                   (session/update-input! :n {:value 3})
                                    nil)}))]
-    (session/receive! session {:type "init" :inputs {}})
+    (session/receive! session (signals {"dsh" {"kinds" {"xCol" "edn" "n" "number"}}}))
     (settle! t)
-    (is (= {:type "update-input" :id "col"
-            :props {:choices [{:value ":a" :label "a"} {:value ":b" :label "b"}]
-                    :selected ":b"}}
-           (last @sent)))))
+    (is (= [{:type "choices" :id "col" :signal "col"
+             :choices [{:value ":a" :label "a"} {:value ":b" :label "b"}]
+             :selected ":b"}
+            {:type "signals" :signals {"xCol" ":c"}}
+            {:type "signals" :signals {"n" "3"}}]
+           (take-last 3 (remove #(#{"busy" "idle"} (:type %)) @sent))))))

@@ -1,4 +1,5 @@
-# Caddy proxies websockets with no extra configuration.
+# Caddy streams server-sent events (the sessions' event streams) with no
+# extra configuration.
 dashboards.example.com {
 	reverse_proxy dashboards:8080
 }

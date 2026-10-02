@@ -5,18 +5,19 @@
         io.github.kirahowe/dashboards-server {:local/root "server"}}
 
  :aliases
- {;; Serve every example app: clojure -M:examples
+ {;; Serve every example app: bb examples
   :examples {:main-opts ["-m" "dashboards.server.main"
                          "--apps-dir" "examples/apps"
                          "--title" "clj-dashboards examples"]}
 
-  ;; The server CLI, for anything else: clojure -M:serve --app examples/apps/hello
+  ;; The server CLI, for anything else: bb serve --app examples/apps/hello
   :serve {:main-opts ["-m" "dashboards.server.main"]}
 
   :dev {:extra-paths ["dev" "core/test" "server/test"]}
 
-  ;; Run every test: clojure -X:test
+  ;; Run every test: bb test
   :test {:extra-paths ["core/test" "server/test"]
-         :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                      org.slf4j/slf4j-nop {:mvn/version "1.7.36"}}
          :exec-fn cognitect.test-runner.api/test
          :exec-args {:dirs ["core/test" "server/test"]}}}}

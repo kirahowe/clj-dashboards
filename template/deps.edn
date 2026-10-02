@@ -1,6 +1,6 @@
 ;; A dashboard project of your own. Copy this directory and rename
-;; my-dashboard. :git/sha pins the clj-dashboards version; to upgrade, set
-;; it to a newer commit (`git ls-remote https://github.com/kirahowe/clj-dashboards`).
+;; my-dashboard. :git/sha pins the clj-dashboards version; `bb upgrade`
+;; moves it to the latest commit.
 {:paths ["src" "resources"]
  :deps {org.clojure/clojure {:mvn/version "1.12.6"}
         ;; For writing the app: UI, reactivity, rendering.
@@ -15,13 +15,13 @@
          :deps/root "server"}}
 
  :aliases
- {;; REPL-driven development: clj -M:dev, then (go) from dev/user.clj
+ {;; REPL-driven development: bb repl, then (go) from dev/user.clj
   :dev {:extra-paths ["dev"]}
 
-  ;; Serve the app: clojure -M:run  (http://localhost:8080/)
+  ;; Serve the app: bb run  (http://localhost:8080/)
   :run {:main-opts ["-m" "dashboards.server.main" "--app" "my-dashboard.app/app"]}
 
-  ;; Build a standalone jar: clojure -T:build uber
+  ;; Build a standalone jar: bb uber
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.14"}}
           :ns-default build}
 

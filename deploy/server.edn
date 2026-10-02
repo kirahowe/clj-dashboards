@@ -14,4 +14,7 @@
  :sanitize-errors? true
 
  ;; Refuse new sessions beyond this many (nil for no limit).
- :max-sessions 200}
+ :max-sessions 200
+
+ ;; End a session after this long without a heartbeat from its page.
+ :session-timeout-ms 120000}
