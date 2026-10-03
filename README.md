@@ -52,7 +52,7 @@ infrastructure that serves them.
 |---|---|---|
 | [`core/`](core) | **Writing apps.** UI components, the reactive engine, renderers, the session protocol and the browser client (Datastar plus a small companion script). It knows nothing about HTTP servers. | the `shiny` package |
 | [`server/`](server) | **Hosting apps.** An http-kit server that runs each browser tab's session over a server-sent event stream, plus downloads and static files. It serves one app, a list of apps, or a directory of app folders, and reloads them when they change. | Shiny Server |
-| [`deploy/`](deploy) | A container image of the server, with a compose file, an HTTPS proxy and an nginx snippet. | `rocker/shiny` |
+| [`deploy/`](deploy) | A container image of the server, with a compose file, an HTTPS proxy and an nginx example. | `rocker/shiny` |
 | [`template/`](template) | A starter project for your own dashboard: REPL setup, uberjar build and Dockerfile. | |
 | [`examples/apps/`](examples/apps) | Example apps, each a folder with an `app.clj`. | `shiny::runExample()` |
 
@@ -210,7 +210,9 @@ HTTP, with no websockets.
   stream drops simply reopens it and carries on in the same session.
   Because the inputs live in the browser, a page outlives even a server
   restart: it reconnects to a fresh session that starts from the inputs
-  the page already has.
+  the page already has. A drop that is back within about 1.5 seconds
+  goes unnoticed; a longer one shows *Reconnecting…* until the stream
+  returns.
 - **Session lifetime:** a session lives as long as its page sends a
   heartbeat (every 20s). It ends after `:session-timeout-ms` of silence,
   or straight away when the page closes and sends its goodbye beacon.
@@ -253,8 +255,8 @@ New or changed apps are picked up without a restart. If an app needs
 libraries beyond the bundled scicloj stack, list them as `:deps` in a
 `deps.edn` next to its `app.clj`.
 [`deploy/docker-compose.yml`](deploy/docker-compose.yml) adds Caddy for
-automatic HTTPS, and [`deploy/server.edn`](deploy/server.edn) documents
-the settings.
+automatic HTTPS and HTTP/2, and [`deploy/server.edn`](deploy/server.edn)
+documents the settings.
 
 ### 2. Your own project and uberjar
 
@@ -270,7 +272,8 @@ bb upgrade                      # move to the latest clj-dashboards
 ```
 
 The jar runs anywhere Java 21 does: a VM, Fly.io, Render, Kubernetes or
-systemd. Point health checks at `/_health`.
+systemd. Point health checks at `/_health`, and see
+[Running it in production](#running-it-in-production).
 
 ### 3. Embedded in your own service
 
@@ -291,20 +294,158 @@ through `receive!`.
 `bb serve --help` lists them. The options are
 `--app [PATH=]APP` (repeatable), `--apps-dir`, `--config FILE`, `--port`,
 `--host`, `--base-path`, `--title`, `--no-reload`, `--sanitize-errors`
-and `--max-sessions`. A config file can also set `:session-timeout-ms`
-and `:keep-alive-ms`. The environment variables `PORT`, `HOST`,
-`DASHBOARDS_CONFIG`, `DASHBOARDS_APPS_DIR` and `DASHBOARDS_BASE_PATH`
-also work.
+and `--max-sessions`. A config file can also set `:session-timeout-ms`,
+`:keep-alive-ms` and `:shutdown-delay-ms`. The environment variables
+`PORT`, `HOST`, `DASHBOARDS_CONFIG`, `DASHBOARDS_APPS_DIR` and
+`DASHBOARDS_BASE_PATH` also work.
 
-### Behind a proxy
+### Running it in production
 
-Every URL an app uses is relative, so it works under any path prefix.
-Everything is ordinary HTTP. The one thing a proxy must do is not
-buffer the event stream (`_dashboards/stream`). The server sends
-`X-Accel-Buffering: no`, which nginx honours, and a comment every 20s
-keeps idle streams open. See [`deploy/nginx.conf`](deploy/nginx.conf).
-Each tab's session lives in server memory, so if you run more than one
-replica, use sticky sessions, as with Shiny.
+Everything is ordinary HTTP, and every URL an app uses is relative, so
+it works behind any proxy and under any path prefix. Two things are
+unusual: each open tab holds one long-lived response (its event stream,
+`_dashboards/stream`), and each tab's session lives in the memory of one
+server process. Most of what follows comes from those two facts.
+
+**Serve HTTP/2 to browsers.** The server speaks HTTP/1.1, and over
+HTTP/1.1 a browser opens at most six connections to a host, shared by
+all its tabs. Every open dashboard tab keeps one of them busy with its
+stream, so someone with a handful of tabs open runs out: new tabs hang,
+and inputs stop responding because their POSTs can't get a connection.
+Over HTTP/2 all the tabs share one connection, with room for many
+streams (the browser and proxy negotiate the limit; 100 is typical). So
+put a proxy that speaks HTTP/2 in front. Caddy does by default, as in
+[`deploy/docker-compose.yml`](deploy/docker-compose.yml), and
+[`deploy/nginx.conf`](deploy/nginx.conf) turns it on for nginx. The hop
+from the proxy to the server can stay HTTP/1.1.
+
+**Don't buffer the stream.** A proxy that buffers responses holds the
+stream's events back, so the page loads but its outputs never arrive.
+The server sends `X-Accel-Buffering: no`, which nginx honours, and Caddy
+flushes event streams as they come. For anything else, turn response
+buffering off for `_dashboards/stream`. If the stream opens but the
+server's first event hasn't arrived within 5 seconds, the page shows a
+notice that something between the browser and the server (a proxy, VPN,
+antivirus or corporate firewall) may be buffering it. If only some
+users see it, the culprit is probably on their side; if everyone does,
+look at your own proxy.
+
+**Idle timeouts.** Proxies and load balancers close connections that
+stay silent too long. The server sends a no-op event on every stream
+every 20 seconds (`:keep-alive-ms`), comfortably inside common limits
+such as the AWS Application Load Balancer's 60 second idle timeout,
+Heroku's 55 second rolling window and Cloudflare's 125 second proxy
+read timeout. If something in your path is stricter, lower
+`:keep-alive-ms`. A proxy that caps how long a response may last only
+causes a reconnect: the browser reopens the stream and carries on in
+the same session.
+
+**Deploys and shutdown.** When the server is stopped (SIGTERM, or
+`server/stop!`), it:
+
+1. answers 503 on `/_health` and to new streams, so load balancers stop
+   sending it new tabs;
+2. waits `:shutdown-delay-ms` (default 0) for them to notice;
+3. closes every open stream, so each browser reconnects straight away,
+   to another instance or to this one once it's back;
+4. ends the sessions and exits.
+
+A tab that reconnects to a different or restarted server gets a fresh
+session that starts from the inputs the page already has, so users keep
+their selections. Per-session state that lives only on the server, such
+as an `r/value` created inside a server function, does not survive and
+starts again from its initial value. Top-level shared state belongs to
+one process, so it doesn't outlive a restart either, and each replica
+has its own. Keep anything that must outlast a deploy in a database.
+
+Point readiness checks at `/_health`. Behind a load balancer, set
+`:shutdown-delay-ms` long enough for it to see the 503 (a couple of
+health-check intervals) and shorter than the time the platform allows
+between SIGTERM and killing the process: 10 seconds for `docker stop`
+and Cloud Run, 30 seconds by default on Kubernetes
+(`terminationGracePeriodSeconds`). 5000 suits most container setups.
+With a single instance and nothing to drain to, leave it at 0.
+
+**More than one replica.** A tab's stream and its POSTs must reach the
+same instance, or its input changes go to a server that doesn't have
+its session. So, as with Shiny Server, use sticky sessions, preferably
+by cookie:
+
+- **Caddy:** `lb_policy cookie`, with `health_uri /_health` so a
+  draining instance stops getting new tabs (example in
+  [`deploy/Caddyfile`](deploy/Caddyfile)):
+
+  ```caddy
+  reverse_proxy dashboards-1:8080 dashboards-2:8080 {
+  	lb_policy cookie
+  	health_uri /_health
+  	health_interval 5s
+  }
+  ```
+
+- **nginx:** `sticky cookie`, which is in open-source nginx from 1.29.6
+  (before that, only nginx Plus). On older versions use
+  `hash $remote_addr consistent;`, which keys on the client's IP
+  address: everyone behind one NAT or corporate proxy lands on the same
+  instance, and a phone that changes networks moves to another (where
+  it starts a fresh session from its inputs). `consistent` keeps most
+  clients in place when you add or remove an instance. Adding
+  `proxy_next_upstream error timeout http_503;` to the location lets a
+  reconnecting stream that reaches a draining instance try another.
+
+  ```nginx
+  upstream dashboards {
+      server 10.0.0.1:8080;
+      server 10.0.0.2:8080;
+      sticky cookie dsh_server path=/ httponly secure;
+  }
+  ```
+
+- **Kubernetes:** a readiness probe on `/_health`, and cookie affinity
+  on the ingress. With ingress-nginx (retired in March 2026, but still
+  common; other controllers have equivalents):
+
+  ```yaml
+  metadata:
+    annotations:
+      nginx.ingress.kubernetes.io/affinity: "cookie"
+      nginx.ingress.kubernetes.io/affinity-mode: "persistent"
+      nginx.ingress.kubernetes.io/session-cookie-name: "dsh-server"
+  ```
+
+  `persistent` stops ingress-nginx moving existing sessions to new pods
+  when the deployment scales up.
+
+- **AWS Application Load Balancer:** turn on target group stickiness
+  with a load-balancer cookie, and use `/_health` as the target group's
+  health check:
+
+  ```sh
+  aws elbv2 modify-target-group-attributes --target-group-arn <arn> \
+    --attributes Key=stickiness.enabled,Value=true Key=stickiness.type,Value=lb_cookie
+  ```
+
+**Where it runs.** It needs a long-running process that can hold many
+open responses at once.
+
+- Fine: a VM, any container host, Fly.io, Render and Kubernetes. On
+  Fly.io and Render, run one instance per app unless you set up
+  affinity yourself (on Fly.io, with `fly-replay`).
+- Fine: Google Cloud Run, with session affinity, at least one instance
+  kept running so pages don't wait for a JVM to start, and the request
+  timeout raised from its 5 minute default to the 60 minute maximum so
+  streams aren't cut needlessly:
+  `gcloud run services update SERVICE --session-affinity --min-instances 1 --timeout 3600`.
+  Cloud Run's affinity is best effort, so expect the occasional fresh
+  session.
+- Not a fit: AWS Lambda and other serverless functions. Invocations
+  are short-lived (15 minutes at most on Lambda) and spread across
+  instances, so a tab's POSTs don't reach the process holding its
+  session.
+- Not a fit: Amazon API Gateway REST APIs in front of the server. By
+  default they buffer the whole response and give up after 29 seconds;
+  their streaming mode still ends a response after 15 minutes. Put an
+  Application Load Balancer in front instead.
 
 ## Development
 
