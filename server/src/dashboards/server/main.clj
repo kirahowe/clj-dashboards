@@ -20,8 +20,9 @@
       --shutdown-delay-ms N
                          on SIGTERM, fail /_health for N ms before
                          closing streams (default 0, or
-                         $DASHBOARDS_SHUTDOWN_DELAY_MS); 5000-10000
-                         suits a load balancer or Kubernetes
+                         $DASHBOARDS_SHUTDOWN_DELAY_MS); behind a load
+                         balancer, its health-check interval times its
+                         failure threshold, under the kill grace period
 
   Command-line options override the config file, which overrides the
   environment variables.
