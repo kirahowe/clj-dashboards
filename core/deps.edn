@@ -4,7 +4,8 @@
         com.cnuernber/charred {:mvn/version "1.043"}
         org.scicloj/kindly {:mvn/version "4-beta25"}
         scicloj/tablecloth {:mvn/version "8.024"}
-        org.scicloj/plotje {:mvn/version "0.16.1"}}
+        org.scicloj/plotje {:mvn/version "0.16.1"}
+        dev.data-star.clojure/sdk {:mvn/version "1.0.0-RC11"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}

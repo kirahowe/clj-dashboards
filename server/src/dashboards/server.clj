@@ -32,7 +32,8 @@
             [dashboards.html :as html]
             [dashboards.server.apps :as apps]
             [dashboards.session :as session]
-            [org.httpkit.server :as http])
+            [org.httpkit.server :as http]
+            [starfederation.datastar.clojure.adapter.http-kit :as sse])
   (:import (java.io File)
            (java.net URLDecoder URLEncoder)
            (java.util.concurrent Executors ScheduledExecutorService TimeUnit)
@@ -88,19 +89,7 @@
 
 (defn- session-count [server-state] (count @(:sessions server-state)))
 
-(defn- query-param [req k]
-  (some (fn [pair]
-          (let [[pk v] (str/split pair #"=" 2)]
-            (when (= k (url-decode pk)) (url-decode (or v "")))))
-        (some-> (:query-string req) (str/split #"&"))))
-
-(defn- body-string [req]
-  (some-> (:body req) slurp))
-
-(def ^:private sse-headers
-  {"Content-Type" "text/event-stream"
-   "Cache-Control" "no-cache, no-transform"
-   "X-Accel-Buffering" "no"})
+;; Each session's stream is a Datastar SDK SSE generator (`gen`).
 
 (defn- now [] (System/currentTimeMillis))
 
@@ -108,8 +97,8 @@
   "Forget session `sid` and stop it."
   [server-state sid]
   (let [[old _] (swap-vals! (:sessions server-state) dissoc sid)]
-    (when-let [{:keys [session channel]} (get old sid)]
-      (swap! (:channels server-state) dissoc channel)
+    (when-let [{:keys [session gen]} (get old sid)]
+      (swap! (:streams server-state) dissoc gen)
       (session/close! session))))
 
 (defn- touch!
@@ -119,22 +108,22 @@
          (fn [m] (if (contains? m sid) (assoc-in m [sid :seen] (now)) m))))
 
 (defn- attach!
-  "Point session `s` at the stream `ch` (replacing any earlier one)."
-  [server-state s ch]
+  "Point session `s` at the stream `gen` (replacing any earlier one)."
+  [server-state s gen]
   (let [sid (:id s)
-        [old _] (swap-vals! (:sessions server-state) assoc sid {:session s :channel ch :seen (now)})]
-    (when-let [old-ch (get-in old [sid :channel])]
-      (swap! (:channels server-state) dissoc old-ch))
-    (swap! (:channels server-state) assoc ch sid)
-    (session/set-transport! s (fn [msg] (http/send! ch (datastar/event msg) false)))))
+        [old _] (swap-vals! (:sessions server-state) assoc sid {:session s :gen gen :seen (now)})]
+    (when-let [old-gen (get-in old [sid :gen])]
+      (swap! (:streams server-state) dissoc old-gen))
+    (swap! (:streams server-state) assoc gen sid)
+    (session/set-transport! s (fn [msg] (datastar/send! gen msg)))))
 
 (defn- housekeeping!
   "Run periodically: comment on every stream so proxies keep idle ones
   open, and end sessions whose browser has not been heard from (by
   heartbeat, signals or a reconnecting stream) within the timeout."
   [server-state]
-  (doseq [ch (keys @(:channels server-state))]
-    (http/send! ch datastar/keep-alive false))
+  (doseq [gen (keys @(:streams server-state))]
+    (try (datastar/keep-alive! gen) (catch Exception _ nil)))
   (let [cutoff (- (now) (:session-timeout-ms (:config server-state)))]
     (doseq [[sid {:keys [seen]}] @(:sessions server-state)
             :when (< seen cutoff)]
@@ -145,8 +134,7 @@
   resumes the one named in the signals, after a reconnect."
   [server-state mount req]
   (let [{:keys [max-sessions sanitize-errors?]} (:config server-state)
-        signals (try (datastar/read-signals (query-param req "datastar"))
-                     (catch Exception _ {}))
+        signals (try (datastar/read-signals req) (catch Exception _ {}))
         sid (get-in signals ["dsh" "session"])
         existing (some-> (get @(:sessions server-state) sid) :session)]
     (cond
@@ -154,40 +142,38 @@
       {:status 503 :headers {"Content-Type" "text/plain"} :body "At capacity"}
 
       :else
-      (http/as-channel
+      (sse/->sse-response
        req
-       {:on-open
-        (fn [ch]
-          (http/send! ch {:status 200 :headers sse-headers} false)
+       {:headers {"Cache-Control" "no-cache, no-transform" "X-Accel-Buffering" "no"}
+        sse/on-open
+        (fn [gen]
           (try
             (let [s (or (when (and existing (not (session/closed? existing))) existing)
                         (session/start! (apps/resolve-app (:source mount))
                                         {:request (dissoc req :async-channel :body)
                                          :sanitize-errors? sanitize-errors?}))]
-              (attach! server-state s ch)
+              (attach! server-state s gen)
               (session/connected! s)
               (session/receive! s signals))
             (catch Throwable t
               (log "failed to start session for" (:path mount) "-" (ex-message t))
-              (http/send! ch (datastar/event
-                              {:type "notification" :level "error" :duration nil
-                               :message (str "The app could not start: "
-                                             (if sanitize-errors? "see the server log." (ex-message t)))})
-                          false))))
+              (datastar/send! gen {:type "notification" :level "error" :duration nil
+                                   :message (str "The app could not start: "
+                                                 (if sanitize-errors? "see the server log." (ex-message t)))}))))
         ;; Not every server reports a client going away from a
         ;; streaming response, so the session isn't ended here: the
         ;; browser's heartbeat and close beacon decide (see
         ;; `housekeeping!`).
-        :on-close
-        (fn [ch _status]
-          (when-let [sid (get @(:channels server-state) ch)]
-            (swap! (:channels server-state) dissoc ch)
-            (when-let [s (get-in @(:sessions server-state) [sid :session])]
-              (when (= ch (get-in @(:sessions server-state) [sid :channel]))
-                (session/set-transport! s nil)))))}))))
+        sse/on-close
+        (fn [gen & _]
+          (when-let [sid (get @(:streams server-state) gen)]
+            (swap! (:streams server-state) dissoc gen)
+            (when (= gen (get-in @(:sessions server-state) [sid :gen]))
+              (some-> (get-in @(:sessions server-state) [sid :session])
+                      (session/set-transport! nil)))))}))))
 
 (defn- read-body [req]
-  (try (datastar/read-signals (body-string req)) (catch Exception _ nil)))
+  (try (datastar/read-signals req) (catch Exception _ nil)))
 
 (def ^:private no-content {:status 204 :body ""})
 
@@ -391,7 +377,7 @@
                :static-mounts static-mounts
                :dir-sources (atom {})
                :sessions (atom {})
-               :channels (atom {})
+               :streams (atom {})
                :scheduler (Executors/newSingleThreadScheduledExecutor)}
         _ (.scheduleAtFixedRate ^ScheduledExecutorService (:scheduler state)
                                 ^Runnable #(try (housekeeping! state)

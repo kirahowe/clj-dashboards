@@ -9,7 +9,7 @@ The library you write dashboards with. It has no web-server dependency.
 | `dashboards.render` | render specs: `plot` (plotje), `table` (tablecloth), `text`, `print`, `ui`, `auto`, `download` |
 | `dashboards.reactive` | the reactive engine: `value`, `reactive`, `observe`, `observe-event`, `event-reactive`, `isolate`, `req`, `validate`, `invalidate-later`, `reactive-poll`, `debounce` |
 | `dashboards.session` | one browser tab's session: takes Datastar signal snapshots, sends message maps; plus helpers for server functions (`notify!`, `update-input!`, `on-ended`, `request`) |
-| `dashboards.datastar` | session messages as Datastar SSE events |
+| `dashboards.datastar` | session messages as Datastar SSE events, via the Datastar Clojure SDK; reading the signals a request carries |
 | `dashboards.html` | hiccup → HTML, datasets → tables and CSV |
 
 The browser client is [Datastar](https://data-star.dev) 1.0.4 (vendored,

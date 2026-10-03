@@ -1,6 +1,7 @@
 {:paths ["src"]
  :deps {io.github.kirahowe/dashboards-core {:local/root "../core"}
-        http-kit/http-kit {:mvn/version "2.8.1"}
+        http-kit/http-kit {:mvn/version "2.9.0-beta4"}
+        dev.data-star.clojure/http-kit {:mvn/version "1.0.0-RC11"}
         org.slf4j/slf4j-nop {:mvn/version "1.7.36"}}
  :aliases
  {:test {:extra-paths ["test"]

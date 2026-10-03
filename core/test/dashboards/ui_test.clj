@@ -4,7 +4,8 @@
             [dashboards.app :as app]
             [dashboards.datastar :as datastar]
             [dashboards.html :as html]
-            [dashboards.ui :as ui]))
+            [dashboards.ui :as ui]
+            [starfederation.datastar.clojure.adapter.test :as sse-test]))
 
 (defn- render [h] (html/hiccup->html h))
 
@@ -74,18 +75,36 @@
     (is (nil? (app/asset "../secrets")))))
 
 (deftest sse-events
-  (is (= (str "event: datastar-patch-elements\n"
-              "data: selector #plot\n"
-              "data: mode inner\n"
-              "data: elements <div>\n"
-              "data: elements </div>\n\n"
-              "event: datastar-dashboards\n"
-              "data: type rendered\n"
-              "data: id plot\n"
-              "data: status ok\n\n")
-         (datastar/event {:type "output" :id "plot" :html "<div>\n</div>" :status "ok"})))
-  (is (= "event: datastar-patch-signals\ndata: signals {\"x\":1}\n\n"
-         (datastar/event {:type "signals" :signals {"x" 1}}))))
+  (let [gen (sse-test/->sse-recorder)
+        sent (fn [] @(:!rec gen))]
+    (datastar/send! gen {:type "output" :id "plot" :html "<div>\n</div>" :status "ok"})
+    (is (= [(str "event: datastar-patch-elements\n"
+                 "data: selector #plot\n"
+                 "data: mode inner\n"
+                 "data: elements <div>\n"
+                 "data: elements </div>\n\n")
+            (str "event: datastar-dashboards\n"
+                 "data: type rendered\n"
+                 "data: id plot\n"
+                 "data: status ok\n\n")]
+           (sent)))
+    (datastar/send! gen {:type "output" :id "x" :html "" :status "empty"})
+    (is (str/includes? (nth (sent) 2) "data: elements <!---->")
+        "an empty output still sends something to patch in")
+    (datastar/send! gen {:type "signals" :signals {"x" 1}})
+    (is (= "event: datastar-patch-signals\ndata: signals {\"x\":1}\n\n" (last (sent))))
+    (datastar/send! gen {:type "notification" :message "two\nlines" :level "info" :duration 0})
+    (is (str/includes? (last (sent)) "data: message two\ndata: message lines"))))
+
+(deftest reading-signals
+  (is (= {"n" 1 "dsh" {"session" "s"}}
+         (datastar/read-signals {:request-method :get
+                                 :query-string (str "datastar="
+                                                    (java.net.URLEncoder/encode "{\"n\":1,\"dsh\":{\"session\":\"s\"}}" "UTF-8"))})))
+  (is (= {"n" 2}
+         (datastar/read-signals {:request-method :post
+                                 :body (java.io.ByteArrayInputStream. (.getBytes "{\"n\":2}" "UTF-8"))})))
+  (is (= {} (datastar/read-signals {:request-method :get}))))
 
 (deftest tables
   (let [s (render (html/dataset->hiccup [{:a 1.5 :b "x"} {:a 2.0 :b "y"} {:a nil :b "z"}]

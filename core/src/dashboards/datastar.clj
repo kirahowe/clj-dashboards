@@ -1,9 +1,10 @@
 (ns dashboards.datastar
-  "Session messages as Datastar server-sent events.
+  "Session messages as Datastar server-sent events, written with the
+  Datastar Clojure SDK (https://github.com/starfederation/datastar-clojure).
 
-  The browser runs Datastar (https://data-star.dev): one long-lived
-  SSE stream per tab carries everything the server sends, and the
-  page posts its signals back whenever they change. Outputs arrive as
+  The browser runs Datastar (https://data-star.dev): one long-lived SSE
+  stream per tab carries everything the server sends, and the page
+  posts its signals back whenever they change. Outputs arrive as
   standard `datastar-patch-elements` events, which morph the new HTML
   into the output's element; input values the server sets arrive as
   `datastar-patch-signals`. What Datastar has no event for -- busy and
@@ -11,80 +12,85 @@
   travels as a `datastar-dashboards` event, handled by the small
   companion script `dashboards.js`.
 
-  Any transport that can write text to a response can serve a
-  session: write `(event msg)` for each message the session sends."
+  Any server the SDK has an adapter for (http-kit, Ring, ...) can carry
+  a session: open an SSE response with the adapter, and send each of
+  the session's messages with `(send! sse-gen msg)`."
   (:require [charred.api :as json]
             [clojure.string :as str]
-            [dashboards.html :as html]))
+            [dashboards.html :as html]
+            [starfederation.datastar.clojure.api :as d*]
+            [starfederation.datastar.clojure.protocols :as p]))
+
+(def event-type
+  "The SSE event type for what Datastar has no event of its own for."
+  "datastar-dashboards")
 
 (defn- data-lines
-  "SSE data lines for `key value`, one line of `value` per data line:
-  Datastar joins lines with the same key back together."
-  [k v]
-  (let [lines (str/split-lines (str v))]
-    (if (empty? lines)
-      [(str "data: " k " ")]
-      (map #(str "data: " k " " %) lines))))
+  "Datastar's `key value` data lines for `fields`, one per line of each
+  value: Datastar joins lines with the same key back together."
+  [fields]
+  (vec (for [[k v] fields
+             line (let [lines (str/split-lines (str v))] (if (seq lines) lines [""]))]
+         (str k " " line))))
 
-(defn sse
-  "Format one server-sent event. `fields` is a sequence of
-  `[key value]` pairs, written as Datastar's `data: key value` lines."
-  [event-name fields]
-  (str "event: " event-name "\n"
-       (str/join "\n" (mapcat (fn [[k v]] (data-lines k v)) fields))
-       "\n\n"))
+(defn- dashboards-event! [sse-gen type & fields]
+  (p/send-event! sse-gen event-type (data-lines (cons ["type" type] (partition 2 fields))) {}))
 
-(defn patch-elements
-  "A `datastar-patch-elements` event. Options: `:selector`, `:mode`
-  (`\"outer\"` by default in Datastar; `\"inner\"`, `\"append\"`, ...)."
-  [html {:keys [selector mode]}]
-  (sse "datastar-patch-elements"
-       (cond-> []
-         selector (conj ["selector" selector])
-         mode (conj ["mode" mode])
-         true (conj ["elements" html]))))
+(def ^:private empty-html
+  ;; Datastar needs some element content to patch in; an empty comment
+  ;; clears an output without showing anything.
+  "<!---->")
 
-(defn patch-signals
-  "A `datastar-patch-signals` event merging `signals` (a map) into the
-  page's signals."
-  [signals]
-  (sse "datastar-patch-signals" [["signals" (json/write-json-str signals)]]))
-
-(defn- dashboards-event [type & fields]
-  (sse "datastar-dashboards" (cons ["type" type] (partition 2 fields))))
-
-(defn event
-  "The SSE text for a session message (see `dashboards.session`)."
-  ^String [{:keys [type] :as msg}]
+(defn send!
+  "Send a session message (see `dashboards.session`) on `sse-gen`.
+  Returns false once the connection is closed."
+  [sse-gen {:keys [type] :as msg}]
   (case type
     "connected"
-    (str (patch-signals {"dsh" {"session" (:session msg)}})
-         (dashboards-event "connected"))
+    (and (d*/patch-signals! sse-gen (json/write-json-str {"dsh" {"session" (:session msg)}}))
+         (dashboards-event! sse-gen "connected"))
 
     "output"
-    (str (patch-elements (:html msg) {:selector (html/id-selector (:id msg)) :mode "inner"})
-         (dashboards-event "rendered" "id" (:id msg) "status" (:status msg)))
+    (and (d*/patch-elements! sse-gen
+                             (if (str/blank? (:html msg)) empty-html (:html msg))
+                             {d*/selector (html/id-selector (:id msg))
+                              d*/patch-mode d*/pm-inner})
+         (dashboards-event! sse-gen "rendered" "id" (:id msg) "status" (:status msg)))
 
-    "recalculating" (dashboards-event "recalculating" "id" (:id msg))
-    "busy" (dashboards-event "busy")
-    "idle" (dashboards-event "idle")
-    "signals" (patch-signals (:signals msg))
+    "recalculating" (dashboards-event! sse-gen "recalculating" "id" (:id msg))
+    "busy" (dashboards-event! sse-gen "busy")
+    "idle" (dashboards-event! sse-gen "idle")
+    "signals" (d*/patch-signals! sse-gen (json/write-json-str (:signals msg)))
 
     "choices"
-    (dashboards-event "choices" "id" (:id msg) "signal" (:signal msg)
-                      "choices" (json/write-json-str (:choices msg))
-                      "selected" (json/write-json-str (:selected msg)))
+    (dashboards-event! sse-gen "choices" "id" (:id msg) "signal" (:signal msg)
+                       "choices" (json/write-json-str (:choices msg))
+                       "selected" (json/write-json-str (:selected msg)))
 
     "notification"
-    (dashboards-event "notify" "level" (:level msg) "duration" (or (:duration msg) 0)
-                      "message" (:message msg))))
+    (dashboards-event! sse-gen "notify" "level" (:level msg) "duration" (or (:duration msg) 0)
+                       "message" (:message msg))))
 
-(def keep-alive
-  "An SSE comment, sent periodically so proxies don't close an idle stream."
-  ": keep-alive\n\n")
+(defn keep-alive!
+  "Send an event the browser ignores, so proxies keep an idle stream
+  open. Returns false once the connection is closed."
+  [sse-gen]
+  (dashboards-event! sse-gen "ping"))
 
 (defn read-signals
-  "Parse the signals Datastar sends: the `datastar` query parameter of
-  a GET, or the JSON body of a POST. String keys are kept."
-  [s]
-  (if (str/blank? s) {} (json/read-json s)))
+  "The signals Datastar sent with a Ring request -- the `datastar`
+  query parameter of a GET, or the JSON body of a POST -- as a map with
+  string keys. Works whether or not the request has `:query-params`."
+  [request]
+  (let [request (if (and (#{:get :delete} (:request-method request))
+                         (not (:query-params request)))
+                  (assoc request :query-params
+                         {"datastar" (some (fn [pair]
+                                             (let [[k v] (str/split pair #"=" 2)]
+                                               (when (= "datastar" k)
+                                                 (java.net.URLDecoder/decode (str v) "UTF-8"))))
+                                           (some-> (:query-string request) (str/split #"&")))})
+                  request)
+        raw (d*/get-signals request)
+        s (if (string? raw) raw (some-> raw slurp))]
+    (if (str/blank? s) {} (json/read-json s))))

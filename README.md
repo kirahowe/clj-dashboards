@@ -215,9 +215,12 @@ HTTP, with no websockets.
   heartbeat (every 20s). It ends after `:session-timeout-ms` of silence,
   or straight away when the page closes and sends its goodbye beacon.
 
-The protocol is in `dashboards.datastar` (the SSE events) and
-`dashboards.session` (what a session sends and receives). The server
-module is just one transport for it.
+The events are written with the official
+[Datastar Clojure SDK](https://github.com/starfederation/datastar-clojure)
+(`dashboards.datastar`), and the server streams them through the SDK's
+http-kit adapter. `dashboards.session` defines what a session sends
+and receives, so the server module is just one transport: any server
+the SDK has an adapter for can carry a session.
 
 ## Developing at the REPL
 
@@ -278,9 +281,10 @@ systemd. Point health checks at `/_health`.
 ```
 
 Or skip `dashboards.server` entirely. `dashboards.session` is
-transport-agnostic: give `session/start!` a `send!` function, write each
-message it sends as `(dashboards.datastar/event msg)` on an SSE
-response, and feed it the browser's signals with `receive!`.
+transport-agnostic: open an SSE response with any Datastar SDK adapter,
+give `session/start!` a `send!` of `#(dashboards.datastar/send! sse-gen %)`,
+and feed it the browser's signals, read with `dashboards.datastar/read-signals`,
+through `receive!`.
 
 ### Server options
 
