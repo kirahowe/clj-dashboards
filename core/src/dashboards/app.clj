@@ -100,9 +100,22 @@
             [:div.dsh-progress {:aria-hidden "true"}]
             body
             [:div#dsh-notifications.dsh-notifications {:aria-live "polite"}]
+            ;; dashboards.js shows one message at a time, and only after
+            ;; a wait long enough to matter.
             [:div.dsh-disconnected {:hidden true :role "alert"}
              [:div.dsh-disconnected-box
-              [:strong "Reconnecting to the server\u2026"]
+              [:div.dsh-connection-message {:data-dsh-connection "reconnecting"}
+               [:strong "Reconnecting to the server\u2026"]]
+              [:div.dsh-connection-message {:data-dsh-connection "buffering" :hidden true}
+               [:strong "Updates from the server aren\u2019t arriving."]
+               [:p "Something between your browser and the server \u2013 a proxy, VPN, "
+                "antivirus software or a corporate firewall \u2013 may be buffering the "
+                "event stream this page uses for live updates. This isn\u2019t a problem "
+                "with the app. Try another network, or ask your network administrator "
+                "to allow streaming (text/event-stream) responses."]]
+              [:div.dsh-connection-message {:data-dsh-connection "failed" :hidden true}
+               [:strong "Lost the connection to the server."]
+               [:p "Reload the page to reconnect."]]
               [:button.dsh-btn.dsh-btn-secondary {:type "button" :onclick "location.reload()"}
                "Reload"]]]
             ;; Every signal change goes back to the server. Signals whose

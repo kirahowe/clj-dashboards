@@ -389,7 +389,12 @@ html.dsh-busy .dsh-progress { opacity: 1; transition-delay: 0.3s; animation: dsh
   display: flex; align-items: center; gap: 16px;
   background: var(--dsh-surface); border: 1px solid var(--dsh-border); border-radius: var(--dsh-radius);
   padding: 16px 20px; box-shadow: 0 20px 60px rgba(16, 24, 40, 0.18);
+  max-width: min(560px, calc(100vw - 32px));
 }
+.dsh-connection-message[hidden] { display: none; }
+.dsh-connection-message p { margin: 6px 0 0; color: var(--dsh-muted); }
+.dsh-disconnected[data-state="buffering"] .dsh-disconnected-box { border-left: 4px solid var(--dsh-warning); }
+.dsh-disconnected[data-state="failed"] .dsh-disconnected-box { border-left: 4px solid var(--dsh-danger); }
 
 /* ---- Small screens ---------------------------------------------------- */
 

@@ -42,13 +42,88 @@ for (const el of plots(document)) {
   body.setAttribute('data-signals', JSON.stringify(signals));
 }
 
-const { mergePatch, getPath, watcher } = await import(DATASTAR);
-
 const timers = {};
 function later(key, ms, f) {
   clearTimeout(timers[key]);
   timers[key] = setTimeout(f, ms);
 }
+
+// ---------------------------------------------------------------------
+// The connection. The stream's first event on every (re)connect is
+// `connected`; until it arrives the page says why, but only once a
+// wait is long enough to matter.
+
+// A server closes its streams when it restarts for a deploy, and the
+// browser is usually back well within this.
+const RECONNECTING_AFTER_MS = 1500;
+// A request for the stream that has neither failed nor brought
+// `connected` by now is being held up on the way: a proxy, VPN,
+// antivirus or firewall that buffers responses until they end.
+const BUFFERING_AFTER_MS = 5000;
+
+const STREAM_URL = new URL('_dashboards/stream', document.baseURI).href;
+
+// state: null (hidden), 'reconnecting', 'buffering' or 'failed'.
+function showConnection(state) {
+  const overlay = document.querySelector('.dsh-disconnected');
+  if (!overlay) return;
+  overlay.hidden = !state;
+  if (!state) return;
+  overlay.dataset.state = state;
+  for (const m of overlay.querySelectorAll('[data-dsh-connection]')) {
+    m.hidden = m.dataset.dshConnection !== state;
+  }
+}
+
+function cancel(key) {
+  clearTimeout(timers[key]);
+  delete timers[key];
+}
+
+function setConnected(connected) {
+  cancel('buffering');
+  if (connected) {
+    cancel('reconnecting');
+    showConnection(null);
+    return;
+  }
+  document.documentElement.classList.remove('dsh-busy');
+  const overlay = document.querySelector('.dsh-disconnected');
+  // A notice already up means the wait is long enough to matter.
+  if (overlay && !overlay.hidden) showConnection('reconnecting');
+  // Counted from the first failure: each failed retry after it
+  // mustn't push it back.
+  else if (!timers.reconnecting) later('reconnecting', RECONNECTING_AFTER_MS, () => showConnection('reconnecting'));
+}
+
+// Datastar says when it schedules a retry of the stream, but not when
+// the retry starts, so watch for the request itself. Installed before
+// Datastar loads, as it opens the stream as soon as it starts.
+const nativeFetch = window.fetch;
+window.fetch = function (input, ...rest) {
+  const url = String(input instanceof Request ? input.url : input);
+  if (url.split('?')[0] === STREAM_URL) {
+    later('buffering', BUFFERING_AFTER_MS, () => {
+      cancel('reconnecting');
+      showConnection('buffering');
+    });
+  }
+  return nativeFetch.call(this, input, ...rest);
+};
+
+document.addEventListener('datastar-fetch', (e) => {
+  const { type, el } = e.detail;
+  if (!el || el.id !== 'dsh-stream') return;
+  if (type === 'retrying' || type === 'error') {
+    setConnected(false);
+  } else if (type === 'retries-failed') {
+    setConnected(false);
+    cancel('reconnecting');
+    showConnection('failed');
+  }
+});
+
+const { mergePatch, getPath, watcher } = await import(DATASTAR);
 
 const resizeObserver = new ResizeObserver((entries) => {
   for (const { target } of entries) {
@@ -209,12 +284,6 @@ function setChoices({ id, signal, choices, selected }) {
   }));
 }
 
-function setConnected(connected) {
-  const overlay = document.querySelector('.dsh-disconnected');
-  if (overlay) overlay.hidden = connected;
-  if (!connected) document.documentElement.classList.remove('dsh-busy');
-}
-
 watcher({
   name: 'datastar-dashboards',
   apply(_ctx, args) {
@@ -266,13 +335,6 @@ setInterval(() => {
 window.addEventListener('pagehide', (e) => {
   // A page kept in the back/forward cache may come back; keep its session.
   if (!e.persisted && getPath('dsh.session')) navigator.sendBeacon('_dashboards/close', sessionBody());
-});
-
-document.addEventListener('datastar-fetch', (e) => {
-  const { type, el } = e.detail;
-  if (el && el.id === 'dsh-stream' && (type === 'retrying' || type === 'retries-failed' || type === 'error')) {
-    setConnected(false);
-  }
 });
 
 // ---------------------------------------------------------------------
