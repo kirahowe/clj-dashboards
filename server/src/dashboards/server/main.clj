@@ -42,35 +42,46 @@
               app)]
     {:path path :app app}))
 
+(defn- whole-number
+  "`s` as a non-negative whole number; `what` (a flag or environment
+  variable) names it in the error when it isn't one."
+  [what s]
+  (let [n (some-> s str/trim parse-long)]
+    (when-not (and n (not (neg? n)))
+      (throw (ex-info (str what " expects a whole number, not " (pr-str s)) {:option what :value s})))
+    n))
+
 (defn parse-args [args]
   (loop [[a & more :as args] args, opts {}]
     (if (empty? args)
       opts
-      (let [[v & rest] more]
+      (let [[v & rest] more
+            value (fn [] (if (some? v) v (throw (ex-info (str a " needs a value") {:option a}))))
+            number (fn [] (whole-number a (value)))]
         (case a
-          "--config" (recur rest (assoc opts :config-file v))
-          "--apps-dir" (recur rest (assoc opts :apps-dir v))
-          "--app" (recur rest (update opts :apps (fnil conj []) (parse-app v)))
-          "--port" (recur rest (assoc opts :port (parse-long v)))
-          "--host" (recur rest (assoc opts :host v))
-          "--base-path" (recur rest (assoc opts :base-path v))
-          "--title" (recur rest (assoc opts :title v))
-          "--max-sessions" (recur rest (assoc opts :max-sessions (parse-long v)))
-          "--shutdown-delay-ms" (recur rest (assoc opts :shutdown-delay-ms (parse-long v)))
+          "--config" (recur rest (assoc opts :config-file (value)))
+          "--apps-dir" (recur rest (assoc opts :apps-dir (value)))
+          "--app" (recur rest (update opts :apps (fnil conj []) (parse-app (value))))
+          "--port" (recur rest (assoc opts :port (number)))
+          "--host" (recur rest (assoc opts :host (value)))
+          "--base-path" (recur rest (assoc opts :base-path (value)))
+          "--title" (recur rest (assoc opts :title (value)))
+          "--max-sessions" (recur rest (assoc opts :max-sessions (number)))
+          "--shutdown-delay-ms" (recur rest (assoc opts :shutdown-delay-ms (number)))
           "--no-reload" (recur more (assoc opts :reload? false))
           "--sanitize-errors" (recur more (assoc opts :sanitize-errors? true))
           ("-h" "--help") (recur more (assoc opts :help? true))
           (throw (ex-info (str "Unknown option: " a) {:arg a})))))))
 
 (defn- env-config []
-  (let [env #(not-empty (System/getenv %))]
+  (let [env #(not-empty (System/getenv %))
+        number #(whole-number (str "$" %) (env %))]
     (cond-> {}
-      (env "PORT") (assoc :port (parse-long (env "PORT")))
+      (env "PORT") (assoc :port (number "PORT"))
       (env "HOST") (assoc :host (env "HOST"))
       (env "DASHBOARDS_BASE_PATH") (assoc :base-path (env "DASHBOARDS_BASE_PATH"))
       (env "DASHBOARDS_APPS_DIR") (assoc :apps-dir (env "DASHBOARDS_APPS_DIR"))
-      (env "DASHBOARDS_SHUTDOWN_DELAY_MS") (assoc :shutdown-delay-ms
-                                                  (parse-long (env "DASHBOARDS_SHUTDOWN_DELAY_MS")))
+      (env "DASHBOARDS_SHUTDOWN_DELAY_MS") (assoc :shutdown-delay-ms (number "DASHBOARDS_SHUTDOWN_DELAY_MS"))
       (env "DASHBOARDS_CONFIG") (assoc :config-file (env "DASHBOARDS_CONFIG")))))
 
 (defn- read-config-file [path]
@@ -89,7 +100,11 @@
       (:help? cli) (assoc :help? true))))
 
 (defn -main [& args]
-  (let [config (config-from args)]
+  (let [config (try (config-from args)
+                    (catch clojure.lang.ExceptionInfo e
+                      (binding [*out* *err*]
+                        (println (str (ex-message e) ". See --help.")))
+                      (System/exit 2)))]
     (when (:help? config)
       (println (:doc (meta (find-ns 'dashboards.server.main))))
       (System/exit 0))

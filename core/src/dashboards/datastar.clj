@@ -50,6 +50,11 @@
     (and (d*/patch-signals! sse-gen (json/write-json-str {"dsh" {"session" (:session msg)}}))
          (dashboards-event! sse-gen "connected"))
 
+    ;; The stream is up but no session could start on it (the app
+    ;; failed to load): the page stops waiting for `connected`, so the
+    ;; error notification sent with it stays in view.
+    "failed" (dashboards-event! sse-gen "failed")
+
     "output"
     (and (d*/patch-elements! sse-gen
                              (if (str/blank? (:html msg)) empty-html (:html msg))
