@@ -17,9 +17,18 @@
       --no-reload        don't reload app directories when they change
       --sanitize-errors  hide error details from users
       --max-sessions N   refuse sessions beyond N
+      --shutdown-delay-ms N
+                         on SIGTERM, fail /_health for N ms before
+                         closing streams (default 0, or
+                         $DASHBOARDS_SHUTDOWN_DELAY_MS); 5000-10000
+                         suits a load balancer or Kubernetes
 
   Command-line options override the config file, which overrides the
-  environment variables."
+  environment variables.
+
+  On SIGTERM the server stops gracefully (see
+  `dashboards.server/stop!`): /_health answers 503 while it drains,
+  then every open stream is closed so browsers reconnect elsewhere."
   (:require [clojure.edn :as edn]
             [clojure.string :as str]
             [dashboards.server :as server])
@@ -47,6 +56,7 @@
           "--base-path" (recur rest (assoc opts :base-path v))
           "--title" (recur rest (assoc opts :title v))
           "--max-sessions" (recur rest (assoc opts :max-sessions (parse-long v)))
+          "--shutdown-delay-ms" (recur rest (assoc opts :shutdown-delay-ms (parse-long v)))
           "--no-reload" (recur more (assoc opts :reload? false))
           "--sanitize-errors" (recur more (assoc opts :sanitize-errors? true))
           ("-h" "--help") (recur more (assoc opts :help? true))
@@ -59,6 +69,8 @@
       (env "HOST") (assoc :host (env "HOST"))
       (env "DASHBOARDS_BASE_PATH") (assoc :base-path (env "DASHBOARDS_BASE_PATH"))
       (env "DASHBOARDS_APPS_DIR") (assoc :apps-dir (env "DASHBOARDS_APPS_DIR"))
+      (env "DASHBOARDS_SHUTDOWN_DELAY_MS") (assoc :shutdown-delay-ms
+                                                  (parse-long (env "DASHBOARDS_SHUTDOWN_DELAY_MS")))
       (env "DASHBOARDS_CONFIG") (assoc :config-file (env "DASHBOARDS_CONFIG")))))
 
 (defn- read-config-file [path]
