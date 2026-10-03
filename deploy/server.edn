@@ -29,4 +29,10 @@
  ;; default) with a single instance. Can also be set with
  ;; --shutdown-delay-ms or DASHBOARDS_SHUTDOWN_DELAY_MS.
  ;; :shutdown-delay-ms 5000
+
+ ;; Apps load in the background as the server starts; /_health reports
+ ;; 503 "starting" until each has loaded, failed or taken longer than
+ ;; this, and nothing waits longer than this for an app. Can also be set
+ ;; with --app-load-timeout-ms or DASHBOARDS_APP_LOAD_TIMEOUT_MS.
+ ;; :app-load-timeout-ms 60000
  }

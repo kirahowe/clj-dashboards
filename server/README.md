@@ -4,8 +4,8 @@ The hosting runtime for dashboards apps, the counterpart of Shiny Server.
 It's an http-kit server that runs each browser tab's session over a
 server-sent event stream (via the Datastar Clojure SDK's http-kit
 adapter, with the page posting its Datastar signals back), and serves client assets, downloads and each app's `www/` files.
-It also has a `/_health` endpoint, which answers 503 once the server
-starts shutting down.
+It also has a `/_health` endpoint, which answers 503 while the server's
+apps are still loading and once it starts shutting down.
 
 From this repository, `bb serve` runs the CLI below with the examples
 on the classpath.
@@ -39,10 +39,14 @@ An app source can be an app value, a var (re-read for each page load), a
 qualified symbol, or a directory containing `app.clj`. Directories reload
 when their files change, and a `deps.edn` beside `app.clj` can add
 libraries at load time (the server must run under the Clojure CLI for
-this). The server loads every app it is given, and every one already in
-`--apps-dir`, before it starts listening, so the first visitors don't
-wait for them; an app that fails to load is logged and shows its error
-when opened, while the rest are served as usual.
+this). The server listens at once, then loads every app it is given, and
+every one already in `--apps-dir`, in the background, so the first
+visitors don't wait for them; `/_health` reports `"starting"` (503)
+until each has loaded, failed, or run out of time
+(`:app-load-timeout-ms`, default 60000). A request for an app still
+loading waits no longer than that. An app that fails or runs out of time
+is logged and shows its error when opened, while the rest are served as
+usual.
 
 ```clojure
 io.github.kirahowe/dashboards-server

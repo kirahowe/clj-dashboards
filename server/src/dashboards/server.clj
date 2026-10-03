@@ -13,6 +13,12 @@
   `:session-timeout-ms` ends, as does one whose page sends its close
   beacon on the way out.
 
+  The server listens as soon as it starts, and loads its apps in the
+  background, each on its own thread: `/_health` answers 503
+  (`starting`) until every app has loaded, failed, or taken longer than
+  `:app-load-timeout-ms`. Nothing waits longer than that for an app, so
+  one whose `app.clj` never returns only fails itself.
+
   Stopping the server (`stop!`, which the standalone server runs on
   SIGTERM) drains it first: `/_health` answers 503 and new streams are
   refused, then every open stream is closed so browsers reconnect at
@@ -47,7 +53,7 @@
   (:import (java.io File)
            (java.net URLDecoder URLEncoder)
            (java.util UUID)
-           (java.util.concurrent Executors ScheduledExecutorService TimeUnit)
+           (java.util.concurrent ExecutorService Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.time LocalDateTime)
            (java.time.format DateTimeFormatter)))
 
@@ -193,44 +199,161 @@
             :when (< seen cutoff)]
       (end-session! server-state sid))))
 
+;; ---------------------------------------------------------------------------
+;; Loading apps
+
+;; Apps are resolved on the server's `:executor`, never on the thread
+;; that needs one, which waits no longer than `:app-load-timeout-ms`
+;; from when the load began: an `app.clj` that never returns must not
+;; hold anything else up. `(:loads server-state)` maps a mount's path to
+;; its load in progress, `{:result <promise> :started <ms>}`, which every
+;; request for the app meanwhile shares -- so a hung app ties up one
+;; thread, not one per request.
+
+(defn- submit! [server-state f]
+  (.execute ^ExecutorService (:executor server-state) ^Runnable f))
+
+(defn- load!
+  "The load of `mount`'s app in progress, starting one if there is none."
+  [server-state {:keys [path source]}]
+  (let [loads (:loads server-state)
+        timeout (:app-load-timeout-ms (:config server-state))
+        mine {:result (promise) :started (now)}
+        current (get (swap! loads #(if (contains? % path) % (assoc % path mine))) path)
+        done! (fn [r]
+                (deliver (:result mine) r)
+                (swap! loads #(if (identical? mine (get % path)) (dissoc % path) %)))]
+    (when (identical? current mine)
+      (try
+        (submit! server-state
+                 (fn []
+                   (let [r (try {:app (apps/resolve-app source)} (catch Throwable t {:error t}))
+                         ms (- (now) (:started mine))]
+                     (done! r)
+                     ;; Whoever was waiting has given up and said so.
+                     (when (and (> ms timeout) (not (closing? server-state)))
+                       (log "the app at" path
+                            (if-let [t (:error r)] (str "failed to load after " ms "ms - " (ex-message t))
+                                    (str "finished loading after " ms "ms")))))))
+        (catch Throwable t (done! {:error t}))))
+    current))
+
+(defn- await-load
+  "The app that load `l` (see `load!`) produced, waiting until `deadline`
+  at the latest. Throws its error if it failed, and an exception with
+  `::not-loaded` in its data if it hasn't finished."
+  [path {:keys [result started]} deadline]
+  (let [r (deref result (max 0 (- deadline (now))) nil)]
+    (cond
+      (nil? r) (throw (ex-info (str "The app at " path " has not finished loading after "
+                                    (- (now) started) "ms; see the server log.")
+                               {::not-loaded path}))
+      (:error r) (throw (:error r))
+      :else (:app r))))
+
+(defn- resolve-app
+  "The app mounted at `mount`, loading it if need be, but waiting no
+  longer than `:app-load-timeout-ms` after its load began."
+  [server-state mount]
+  (let [l (load! server-state mount)]
+    (await-load (:path mount) l (+ (:started l) (:app-load-timeout-ms (:config server-state))))))
+
+;; ---------------------------------------------------------------------------
+;; Starting sessions
+
+(defn- stream-failed!
+  "No session could start on stream `gen` (its app failed to load,
+  say): tell the page why."
+  [server-state mount gen ^Throwable t]
+  (log "failed to start session for" (:path mount) "-" (ex-message t))
+  ;; Stops the page waiting for `connected`, so no connection notice
+  ;; covers the error.
+  (datastar/send! gen {:type "failed"})
+  (datastar/send! gen {:type "notification" :level "error" :duration nil
+                       :message (str "The app could not start: "
+                                     (if (:sanitize-errors? (:config server-state))
+                                       "see the server log."
+                                       (ex-message t)))})
+  ;; Left open, as closing it would have the browser retry (and fail)
+  ;; over and over; but tracked, so it gets keep-alives and `stop!`
+  ;; closes it.
+  (swap! (:streams server-state) update gen #(if (string? %) % ::no-session))
+  (when (closing? server-state) (close-stream! gen)))
+
+(defn- session-opened!
+  "Session `s` is running on a stream that has just opened."
+  [server-state s]
+  (when (closing? server-state)
+    ;; `stop!` began closing streams and sessions while this one was
+    ;; opening, and may have missed it.
+    (end-session! server-state (:id s))))
+
+(defn- apply-pending!
+  "Hand the new session `s` the signals held for it while its app
+  loaded, then stop holding them. A post that arrives meanwhile is held
+  too, and applied after them (see `receive-signals`); one after that
+  goes straight to the session, behind them. So signals reach the
+  session in the order they came."
+  [server-state s]
+  (let [pending (:pending server-state)
+        sid (:id s)]
+    (loop [signals (get @pending sid)]
+      (session/receive! s signals)
+      (let [[_ held] (swap-vals! pending #(if (identical? signals (get % sid)) (dissoc % sid) %))]
+        (when (contains? held sid)
+          (recur (get held sid)))))))
+
 (defn- start-session!
   "Start a new session on stream `gen`, acknowledging the stream before
   the app is resolved: loading an app (a namespace to require, an
   `app.clj`, its deps) can take a while, and the page takes a long wait
   for the acknowledgement as a sign that a proxy is buffering the
-  stream. Returns the attached session, or nil if there is none to
-  carry on with."
+  stream. The app is resolved, and the session started, on the
+  server's executor rather than on one of http-kit's few request
+  threads, which a slow load would otherwise tie up."
   [server-state mount req gen signals]
   (let [sid (str (UUID/randomUUID))
-        pending (:pending server-state)]
+        pending (:pending server-state)
+        streams (:streams server-state)]
+    ;; Signals posted while the app loads replace these (see
+    ;; `receive-signals`).
     (swap! pending assoc sid signals)
     (try
       ;; Tracked while the app loads, so it gets keep-alives, `stop!`
       ;; closes it, and its closing is noticed.
-      (swap! (:streams server-state) update gen #(or % ::loading))
+      (swap! streams update gen #(or % ::loading))
       (datastar/send! gen (session/connected-message sid))
-      (let [s (session/start! (apps/resolve-app (:source mount))
-                              {:id sid
-                               :request (dissoc req :async-channel :body)
-                               :sanitize-errors? (:sanitize-errors? (:config server-state))})]
-        (if (and (contains? @(:streams server-state) gen) (attach! server-state s gen))
-          ;; The latest signals posted while the app loaded (see
-          ;; `receive-signals`), else those the stream opened with.
-          ;; Taken after attaching, so that later posts find the session.
-          (let [[old _] (swap-vals! pending dissoc sid)]
-            (session/resend-outputs! s)
-            (session/receive! s (get old sid signals))
-            s)
-          ;; The stream closed while the app loaded: the browser has
-          ;; gone, or reconnected and started another session.
-          (do (session/close! s) nil)))
-      (finally (swap! pending dissoc sid)))))
+      (submit! server-state
+               (fn []
+                 (try
+                   (let [s (session/start! (resolve-app server-state mount)
+                                           {:id sid
+                                            :request (dissoc req :async-channel :body)
+                                            :sanitize-errors? (:sanitize-errors? (:config server-state))})]
+                     (if (and (contains? @streams gen) (attach! server-state s gen))
+                       (do (session/resend-outputs! s)
+                           ;; After attaching, so that later posts find
+                           ;; the session.
+                           (apply-pending! server-state s)
+                           (session-opened! server-state s))
+                       ;; The stream closed while the app loaded: the
+                       ;; browser has gone, or reconnected and started
+                       ;; another session.
+                       (session/close! s)))
+                   (catch Throwable t
+                     (if (contains? @streams gen)
+                       (stream-failed! server-state mount gen t)
+                       (log "failed to start session for" (:path mount) "-" (ex-message t))))
+                   (finally (swap! pending dissoc sid)))))
+      (catch Throwable t
+        (swap! pending dissoc sid)
+        (throw t)))))
 
 (defn- stream
   "The session's event stream. Opening it starts a session -- or
   resumes the one named in the signals, after a reconnect."
   [server-state mount req]
-  (let [{:keys [max-sessions sanitize-errors?]} (:config server-state)
+  (let [{:keys [max-sessions]} (:config server-state)
         signals (try (datastar/read-signals req) (catch Exception _ {}))
         sid (get-in signals ["dsh" "session"])
         existing (some-> (get @(:sessions server-state) sid) :session)]
@@ -256,34 +379,19 @@
               ;; page counts the wait for this, and a session busy
               ;; running an observer would hold up anything sent
               ;; through it.
-              (let [s (if (and existing (not (session/closed? existing)))
-                        (do (datastar/send! gen (session/connected-message existing))
-                            (if (attach! server-state existing gen)
-                              (do (session/resend-outputs! existing)
-                                  (session/receive! existing signals)
-                                  existing)
-                              ;; It ended just as the browser reconnected
-                              ;; to it: start over from the page's
-                              ;; signals, under a new id.
-                              (start-session! server-state mount req gen signals)))
-                        (start-session! server-state mount req gen signals))]
-                (when (and s (closing? server-state))
-                  ;; `stop!` began closing streams and sessions while
-                  ;; this one was opening, and may have missed it.
-                  (end-session! server-state (:id s))))
+              (if (and existing (not (session/closed? existing)))
+                (do (datastar/send! gen (session/connected-message existing))
+                    (if (attach! server-state existing gen)
+                      (do (session/resend-outputs! existing)
+                          (session/receive! existing signals)
+                          (session-opened! server-state existing))
+                      ;; It ended just as the browser reconnected to
+                      ;; it: start over from the page's signals, under
+                      ;; a new id.
+                      (start-session! server-state mount req gen signals)))
+                (start-session! server-state mount req gen signals))
               (catch Throwable t
-                (log "failed to start session for" (:path mount) "-" (ex-message t))
-                ;; Stops the page waiting for `connected`, so no
-                ;; connection notice covers the error.
-                (datastar/send! gen {:type "failed"})
-                (datastar/send! gen {:type "notification" :level "error" :duration nil
-                                     :message (str "The app could not start: "
-                                                   (if sanitize-errors? "see the server log." (ex-message t)))})
-                ;; Left open, as closing it would have the browser
-                ;; retry (and fail) over and over; but tracked, so it
-                ;; gets keep-alives and `stop!` closes it.
-                (swap! (:streams server-state) update gen #(if (string? %) % ::no-session))
-                (when (closing? server-state) (close-stream! gen))))))
+                (stream-failed! server-state mount gen t)))))
         ;; Not every server reports a client going away from a
         ;; streaming response, so the session isn't ended here: the
         ;; browser's heartbeat and close beacon decide (see
@@ -302,7 +410,7 @@
   (let [signals (read-body req)
         sid (get-in signals ["dsh" "session"])
         ;; A session whose app is still loading takes them once it
-        ;; starts (see `start-session!`).
+        ;; starts, in the order they came (see `apply-pending!`).
         [pending _] (swap-vals! (:pending server-state)
                                 #(if (contains? % sid) (assoc % sid signals) %))]
     (when-not (contains? pending sid)
@@ -334,7 +442,7 @@
   [server-state mount req sub]
   (cond
     (= sub "")
-    (let [the-app (apps/resolve-app (:source mount))]
+    (let [the-app (resolve-app server-state mount)]
       (html-response (app/page-html the-app req)))
 
     (= sub "_dashboards/stream")
@@ -362,15 +470,19 @@
       (text 404 "Not found"))
 
     :else
-    (let [the-app (apps/resolve-app (:source mount))
+    (let [the-app (resolve-app server-state mount)
           www (or (some-> (:www the-app) io/file)
                   (some-> (apps/source-dir (:source mount)) (io/file "www")))]
       (or (serve-file www sub)
           (text 404 "Not found")))))
 
 (defn- index-page [server-state mounts]
-  (let [{:keys [title]} (:config server-state)
-        title (or title "Dashboards")]
+  (let [{:keys [title app-load-timeout-ms]} (:config server-state)
+        title (or title "Dashboards")
+        ;; Every app's load starts at once; then the page waits a moment
+        ;; at most, rather than for an app still loading.
+        loads (mapv (fn [m] [m (load! server-state m)]) (sort-by :path mounts))
+        deadline (+ (now) 1000)]
     (html-response
      (str "<!DOCTYPE html>\n"
           (html/hiccup->html
@@ -387,13 +499,15 @@
                (if (empty? mounts)
                  [:p.dsh-help "No apps are configured."]
                  [:div.dsh-columns.dsh-columns-auto
-                  (for [{:keys [path source]} (sort-by :path mounts)
-                        :let [a (try (apps/resolve-app source) (catch Throwable _ nil))]]
+                  (for [[{:keys [path]} {:keys [result started] :as l}] loads
+                        :let [a (try (await-load path l (min deadline (+ started app-load-timeout-ms)))
+                                     (catch Throwable _ nil))]]
                     [:a.dsh-card.dsh-app-link {:href (str (subs path 1) "/")
                                                :style "text-decoration:none;color:inherit"}
                      [:div.dsh-card-body
                       [:strong {:style "font-size:15px"} (or (:title a) (subs path 1))]
-                      [:span.dsh-help (cond (nil? a) "Failed to load; see the server log."
+                      [:span.dsh-help (cond (and (nil? a) (realized? result)) "Failed to load; see the server log."
+                                            (nil? a) "Not loaded yet; see the server log."
                                             (:description a) (:description a)
                                             :else path)]]])])]]]])))))
 
@@ -436,11 +550,15 @@
             mounts (current-mounts server-state)]
         (cond
           (= uri "/_health")
-          (let [ok? (running? server-state)]
-            {:status (if ok? 200 503)
+          (let [loading @(:starting server-state)
+                status (cond (not (running? server-state)) "draining"
+                             (seq loading) "starting"
+                             :else "ok")]
+            {:status (if (= "ok" status) 200 503)
              :headers {"Content-Type" "application/json" "Cache-Control" "no-store"}
-             :body (json/write-json-str {:status (if ok? "ok" "draining")
-                                         :sessions (session-count server-state)})})
+             :body (json/write-json-str (cond-> {:status status
+                                                 :sessions (session-count server-state)}
+                                          (= "starting" status) (assoc :loading (sort loading))))})
 
           :else
           (if-let [[mount sub] (match-mount mounts uri)]
@@ -456,9 +574,11 @@
               :else (text 404 "Not found")))))
       (catch Throwable t
         (log "error handling" (:uri req) "-" (ex-message t))
-        (text 500 (if (:sanitize-errors? (:config server-state))
-                    "Internal server error"
-                    (str "Error: " (ex-message t))))))))
+        (if (::not-loaded (ex-data t))
+          (text 503 (ex-message t))
+          (text 500 (if (:sanitize-errors? (:config server-state))
+                      "Internal server error"
+                      (str "Error: " (ex-message t)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Starting and stopping
@@ -468,14 +588,37 @@
     p))
 
 (defn- load-apps!
-  "Load every app mounted now, so that no page or stream waits for one
-  to load. An app that fails is logged and left for its first request
-  to report, as a broken app mustn't take the others down."
+  "Start loading every app mounted now, each on its own thread, so that
+  the first visitors don't wait for them. `/_health` reports `starting`
+  until each has loaded, failed or run out of time; one that failed or
+  ran out is logged, and reports it when opened, as a broken app
+  mustn't take the others down."
   [server-state]
-  (doseq [{:keys [path source]} (sort-by :path (current-mounts server-state))]
-    (try (apps/resolve-app source)
-         (catch Throwable t
-           (log "failed to load the app at" path "-" (ex-message t))))))
+  (let [mounts (sort-by :path (current-mounts server-state))
+        starting (:starting server-state)
+        timeout (:app-load-timeout-ms (:config server-state))
+        t0 (now)]
+    (when (seq mounts)
+      (reset! starting (set (map :path mounts)))
+      (log "loading" (count mounts) "app(s):" (str/join " " (map :path mounts))
+           (str "(giving each up to " timeout "ms)"))
+      (doseq [{:keys [path] :as mount} mounts]
+        (submit! server-state
+                 (fn []
+                   (try
+                     (resolve-app server-state mount)
+                     (log "loaded the app at" path "in" (str (- (now) t0) "ms"))
+                     (catch Throwable t
+                       (when-not (closing? server-state)
+                         (if (::not-loaded (ex-data t))
+                           (log "the app at" path "has not loaded after" (str (- (now) t0) "ms;")
+                                "serving the others without it (it reports this when opened)")
+                           (log "failed to load the app at" path "after" (str (- (now) t0) "ms -")
+                                (ex-message t)))))
+                     (finally
+                       (let [[before after] (swap-vals! starting disj path)]
+                         (when (and (contains? before path) (empty? after) (running? server-state))
+                           (log "apps loaded in" (str (- (now) t0) "ms;") "/_health reports ok")))))))))))
 
 (defn start!
   "Start a server. Returns a server map; stop it with `stop!`.
@@ -506,21 +649,35 @@
   - `:shutdown-delay-ms` -- how long `stop!` reports not-ready on
     `/_health` before it closes the open streams (default 0). See
     `stop!`.
+  - `:app-load-timeout-ms` -- the longest anything waits for an app to
+    load (default 60000). See below.
 
-  Every app in `:apps`, and every one already in `:apps-dir`, is loaded
-  before the server starts listening, so that no page or stream waits
-  for one. An app that fails to load is logged and shows its error when
-  opened; the others are served as usual.
+  The server listens at once. Every app in `:apps`, and every one
+  already in `:apps-dir`, then starts loading in the background, each
+  on its own thread, so the first visitors don't wait for them. A page
+  or stream for an app still loading waits for it, but no longer than
+  `:app-load-timeout-ms` after its load began; after that the app
+  reports that it hasn't loaded (503), while the load carries on in
+  case it finishes. An app that fails or runs out of time is logged and
+  shows its error when opened; the others are served as usual.
 
   `GET /_health` answers 200 with `{\"status\": \"ok\", \"sessions\": n}`
-  while the server is running, and 503 with `{\"status\": \"draining\"}`
-  once it is stopping; point load balancer health checks or a
-  Kubernetes readiness probe at it."
+  while the server is running; 503 with `{\"status\": \"starting\",
+  \"loading\": [paths]}` until each app it started with has loaded,
+  failed or run out of time; and 503 with `{\"status\": \"draining\"}`
+  once it is stopping (whether or not it had finished starting). Point
+  load balancer health checks or a Kubernetes readiness probe at it."
   [config]
   (let [config (merge {:port 8080 :host "0.0.0.0" :reload? true
                        :session-timeout-ms 120000 :keep-alive-ms 20000
-                       :shutdown-delay-ms 0}
+                       :shutdown-delay-ms 0 :app-load-timeout-ms 60000}
                       (into {} (remove (comp nil? val)) config))
+        _ (let [t (:app-load-timeout-ms config)]
+            ;; From a config file, so possibly anything.
+            (when-not (and (number? t) (pos? t))
+              (throw (ex-info (str ":app-load-timeout-ms should be a positive number of milliseconds, not "
+                                   (pr-str t))
+                              {:app-load-timeout-ms t}))))
         static-mounts (vec (for [{:keys [path app]} (:apps config)]
                              {:path (normalize-path (or path "/"))
                               :source (apps/->source app :reload? (:reload? config))}))
@@ -530,6 +687,17 @@
                :sessions (atom {})
                :pending (atom {})
                :streams (atom {})
+               :loads (atom {})
+               :starting (atom #{})
+               ;; Loads apps and starts sessions (see `load!`). Daemon
+               ;; threads, as an app that never loads must not keep the
+               ;; process alive.
+               :executor (Executors/newCachedThreadPool
+                          (let [n (atom 0)]
+                            (reify ThreadFactory
+                              (newThread [_ r]
+                                (doto (Thread. ^Runnable r (str "dashboards-loader-" (swap! n inc)))
+                                  (.setDaemon true))))))
                :phase (atom :running)
                :stopped (promise)
                :scheduler (Executors/newSingleThreadScheduledExecutor)}
@@ -538,12 +706,14 @@
                                                (catch Throwable t (log "housekeeping failed:" (ex-message t))))
                                 (long (:keep-alive-ms config)) (long (:keep-alive-ms config))
                                 TimeUnit/MILLISECONDS)
-        _ (load-apps! state)
         stop-fn (http/run-server (handler state)
                                  {:port (:port config)
                                   :ip (:host config)
                                   :legacy-return-value? false
                                   :max-body (* 1024 1024)})]
+    ;; After listening, so a slow or hung app can't keep the server
+    ;; (and its health check) from answering.
+    (load-apps! state)
     (assoc state
            :http stop-fn
            :port (http/server-port stop-fn))))
@@ -613,6 +783,9 @@
            (stop-housekeeping!)
            (step "stopping the HTTP server"
                  #(some-> (http/server-stop! (:http server) {:timeout 1000}) (deref 5000 nil)))
+           ;; Interrupts any app still loading.
+           (step "stopping app loading"
+                 #(.shutdownNow ^ExecutorService (:executor server)))
            ;; Any session a stream raced to start while we were closing.
            (end-sessions!)
            (reset! (:phase server) :stopped)
