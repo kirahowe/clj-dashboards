@@ -30,7 +30,8 @@
   session id, how to decode each input (`dsh.kinds`) and the measured
   size of each plot (`dsh.sizes`).
 
-  **To the browser** go message maps:
+  **To the browser** go message maps (`connected` is written by the
+  hosting layer as each stream opens; see `connected-message`):
 
       {:type \"connected\" :session \"<id>\"}
       {:type \"output\" :id \"plot\" :html \"...\" :status \"ok\"|\"empty\"|\"validation\"|\"error\"}
@@ -311,13 +312,22 @@
   [session send!]
   (reset! (:transport session) (or send! (fn [_]))))
 
-(defn connected!
-  "Tell the browser which session it is talking to, and send every
-  output it may have missed. Call it whenever a stream (re)opens."
+(defn connected-message
+  "The message that tells a browser which session it is talking to:
+  `{:type \"connected\" :session id}`. The hosting layer writes it
+  straight onto each stream as the stream (re)opens, before handing
+  the stream to the session with `set-transport!`, so that it arrives
+  at once even while the session is busy running an observer."
+  [session]
+  {:type "connected" :session (:id session)})
+
+(defn resend-outputs!
+  "Send every output the browser may have missed, on the session's
+  thread (after whatever it is running now). Call it whenever a stream
+  (re)opens, after `set-transport!`."
   [session]
   (r/submit! (:domain session)
              (fn []
-               (send! session {:type "connected" :session (:id session)})
                (doseq [msg (vals @(:outputs session))]
                  (send! session msg)))))
 

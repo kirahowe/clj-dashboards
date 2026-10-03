@@ -115,12 +115,15 @@
 (defn- now [] (System/currentTimeMillis))
 
 (defn- end-session!
-  "Forget session `sid` and stop it."
+  "Forget session `sid`, stop it and close its stream."
   [server-state sid]
   (let [[old _] (swap-vals! (:sessions server-state) dissoc sid)]
     (when-let [{:keys [session gen]} (get old sid)]
       (swap! (:streams server-state) dissoc gen)
-      (session/close! session))))
+      (session/close! session)
+      ;; Should the browser still be there, it reconnects and starts
+      ;; a new session.
+      (close-stream! gen))))
 
 (defn- touch!
   "Note that the browser behind session `sid` is still there."
@@ -129,14 +132,18 @@
          (fn [m] (if (contains? m sid) (assoc-in m [sid :seen] (now)) m))))
 
 (defn- attach!
-  "Point session `s` at the stream `gen` (replacing any earlier one)."
+  "Point session `s` at the stream `gen`, closing any earlier one: the
+  browser has moved on from it, though the server may not have noticed
+  it go."
   [server-state s gen]
   (let [sid (:id s)
-        [old _] (swap-vals! (:sessions server-state) assoc sid {:session s :gen gen :seen (now)})]
-    (when-let [old-gen (get-in old [sid :gen])]
-      (swap! (:streams server-state) dissoc old-gen))
+        [old _] (swap-vals! (:sessions server-state) assoc sid {:session s :gen gen :seen (now)})
+        old-gen (get-in old [sid :gen])]
     (swap! (:streams server-state) assoc gen sid)
-    (session/set-transport! s (fn [msg] (datastar/send! gen msg)))))
+    (session/set-transport! s (fn [msg] (datastar/send! gen msg)))
+    (when (and old-gen (not= old-gen gen))
+      (swap! (:streams server-state) dissoc old-gen)
+      (close-stream! old-gen))))
 
 (defn- housekeeping!
   "Run periodically: comment on every stream so proxies keep idle ones
@@ -179,23 +186,40 @@
                           (session/start! (apps/resolve-app (:source mount))
                                           {:request (dissoc req :async-channel :body)
                                            :sanitize-errors? sanitize-errors?}))]
+                ;; Acknowledge the stream first, straight onto it: the
+                ;; page counts the wait for this, and a session busy
+                ;; running an observer would hold up anything sent
+                ;; through it.
+                (datastar/send! gen (session/connected-message s))
                 (attach! server-state s gen)
-                (session/connected! s)
-                (session/receive! s signals))
+                (if (closing? server-state)
+                  ;; `stop!` began closing streams and sessions while
+                  ;; this one was opening, and may have missed it.
+                  (end-session! server-state (:id s))
+                  (do (session/resend-outputs! s)
+                      (session/receive! s signals))))
               (catch Throwable t
                 (log "failed to start session for" (:path mount) "-" (ex-message t))
+                ;; Stops the page waiting for `connected`, so no
+                ;; connection notice covers the error.
+                (datastar/send! gen {:type "failed"})
                 (datastar/send! gen {:type "notification" :level "error" :duration nil
                                      :message (str "The app could not start: "
-                                                   (if sanitize-errors? "see the server log." (ex-message t)))})))))
+                                                   (if sanitize-errors? "see the server log." (ex-message t)))})
+                ;; Left open, as closing it would have the browser
+                ;; retry (and fail) over and over; but tracked, so it
+                ;; gets keep-alives and `stop!` closes it.
+                (swap! (:streams server-state) update gen #(or % ::no-session))
+                (when (closing? server-state) (close-stream! gen))))))
         ;; Not every server reports a client going away from a
         ;; streaming response, so the session isn't ended here: the
         ;; browser's heartbeat and close beacon decide (see
         ;; `housekeeping!`).
         sse/on-close
         (fn [gen & _]
-          (when-let [sid (get @(:streams server-state) gen)]
-            (swap! (:streams server-state) dissoc gen)
-            (when (= gen (get-in @(:sessions server-state) [sid :gen]))
+          (let [[old _] (swap-vals! (:streams server-state) dissoc gen)
+                sid (get old gen)]
+            (when (and sid (= gen (get-in @(:sessions server-state) [sid :gen])))
               (some-> (get-in @(:sessions server-state) [sid :session])
                       (session/set-transport! nil)))))}))))
 
@@ -458,29 +482,47 @@
   `docker stop`).
 
   Safe to call more than once, and from several threads: later calls
-  wait for the first to finish. Returns nil."
+  wait for the first to finish. Each step carries on past a failure
+  in the one before (logging it), and if the thread is interrupted
+  while draining, the remaining steps run at once (and the thread's
+  interrupt status is restored afterwards), so the server always ends
+  up stopped. Returns nil."
   ([server] (stop! server nil))
   ([server opts]
    (if (compare-and-set! (:phase server) :running :draining)
-     (try
-       (let [delay-ms (or (:shutdown-delay-ms opts) (:shutdown-delay-ms (:config server)) 0)]
-         (when (pos? delay-ms)
-           (log (str "draining: /_health reports 503; closing " (count @(:streams server))
-                     " stream(s) in " delay-ms "ms"))
-           (Thread/sleep (long delay-ms)))
+     (let [interrupted? (volatile! false)
+           step (fn [what f]
+                  (try (f)
+                       (catch InterruptedException _ (vreset! interrupted? true))
+                       (catch Throwable t (log "stopping:" what "failed -" (ex-message t)))))
+           end-sessions! #(doseq [sid (keys @(:sessions server))]
+                            (step (str "ending session " sid) (fn [] (end-session! server sid))))
+           stop-housekeeping! #(step "stopping housekeeping"
+                                     (fn [] (.shutdownNow ^ScheduledExecutorService (:scheduler server))))]
+       (try
+         (let [delay-ms (or (:shutdown-delay-ms opts) (:shutdown-delay-ms (:config server)) 0)]
+           (when (pos? delay-ms)
+             (step "draining"
+                   (fn []
+                     (log (str "draining: /_health reports 503; closing " (count @(:streams server))
+                               " stream(s) in " delay-ms "ms"))
+                     (Thread/sleep (long delay-ms))))))
          (reset! (:phase server) :closing)
-         (.shutdownNow ^ScheduledExecutorService (:scheduler server))
+         (stop-housekeeping!)
          (doseq [gen (keys @(:streams server))]
            (close-stream! gen))
-         (doseq [sid (keys @(:sessions server))]
-           (end-session! server sid))
-         (some-> (http/server-stop! (:http server) {:timeout 1000}) deref)
-         ;; Any session a stream raced to start while we were closing.
-         (doseq [sid (keys @(:sessions server))]
-           (end-session! server sid)))
-       (finally
-         (reset! (:phase server) :stopped)
-         (deliver (:stopped server) true)))
+         (end-sessions!)
+         (finally
+           ;; Whatever happened above, the server ends up stopped.
+           (reset! (:phase server) :closing)
+           (stop-housekeeping!)
+           (step "stopping the HTTP server"
+                 #(some-> (http/server-stop! (:http server) {:timeout 1000}) (deref 5000 nil)))
+           ;; Any session a stream raced to start while we were closing.
+           (end-sessions!)
+           (reset! (:phase server) :stopped)
+           (deliver (:stopped server) true)
+           (when @interrupted? (.interrupt (Thread/currentThread))))))
      @(:stopped server))
    nil))
 

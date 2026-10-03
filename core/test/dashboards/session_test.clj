@@ -42,9 +42,10 @@
 
 (deftest session-lifecycle
   (let [{:keys [session sent] :as t} (start test-app)]
-    (session/connected! session)
+    (is (= {:type "connected" :session (:id session)} (session/connected-message session)))
+    (session/resend-outputs! session)
     (settle! t)
-    (is (= {:type "connected" :session (:id session)} (first @sent)))
+    (is (empty? @sent) "nothing to resend before the server function has run")
 
     (testing "outputs render once the browser sends its signals"
       (session/receive! session (signals {"n" 2 "choice" ":b" "dsh" {"kinds" {"choice" "edn"}}}))
@@ -83,13 +84,13 @@
       (settle! t)
       (is (str/includes? (:html (last-output sent "plot")) "width=\"500\"")))
 
-    (testing "connected! resends every output, for a browser that reconnected"
+    (testing "resend-outputs! resends every output, for a browser that reconnected"
       (reset! sent [])
-      (session/connected! session)
+      (session/resend-outputs! session)
       (settle! t)
-      (is (= "connected" (:type (first @sent))))
+      (is (every? #(= "output" (:type %)) @sent))
       (is (= #{"doubled" "choice" "needs" "checked" "broken" "plot" "table"}
-             (set (keep :id (rest @sent))))))
+             (set (keep :id @sent)))))
 
     (testing "downloads"
       (let [{:keys [filename content-type body]} (session/download! session "file")]

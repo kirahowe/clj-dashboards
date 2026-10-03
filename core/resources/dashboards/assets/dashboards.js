@@ -54,14 +54,25 @@ function later(key, ms, f) {
 // wait is long enough to matter.
 
 // A server closes its streams when it restarts for a deploy, and the
-// browser is usually back well within this.
-const RECONNECTING_AFTER_MS = 1500;
+// browser is usually back well within this. Datastar retries the
+// stream about 0.5s, 1.5s, 3.5s and 7.5s after it drops (an interval
+// of 500ms, doubling), and a notice due just as a retry succeeds would
+// flash up for a moment; 2.5s sits midway between two retries, so a
+// drop the second retry recovers from shows nothing.
+const RECONNECTING_AFTER_MS = 2500;
 // A request for the stream that has neither failed nor brought
 // `connected` by now is being held up on the way: a proxy, VPN,
 // antivirus or firewall that buffers responses until they end.
 const BUFFERING_AFTER_MS = 5000;
 
-const STREAM_URL = new URL('_dashboards/stream', document.baseURI).href;
+// Matched by path, as the page's own URL may change (history.pushState).
+function isStreamUrl(url) {
+  try {
+    return new URL(url, document.baseURI).pathname.endsWith('/_dashboards/stream');
+  } catch {
+    return false;
+  }
+}
 
 // state: null (hidden), 'reconnecting', 'buffering' or 'failed'.
 function showConnection(state) {
@@ -100,21 +111,31 @@ function setConnected(connected) {
 // the retry starts, so watch for the request itself. Installed before
 // Datastar loads, as it opens the stream as soon as it starts.
 const nativeFetch = window.fetch;
+let streamRequest = null; // the latest request for the stream
 window.fetch = function (input, ...rest) {
-  const url = String(input instanceof Request ? input.url : input);
-  if (url.split('?')[0] === STREAM_URL) {
+  const response = nativeFetch.call(this, input, ...rest);
+  if (isStreamUrl(input instanceof Request ? input.url : String(input))) {
+    const request = (streamRequest = {});
     later('buffering', BUFFERING_AFTER_MS, () => {
       cancel('reconnecting');
       showConnection('buffering');
     });
+    // An aborted request isn't being held up. (A failed one is
+    // retried, which Datastar reports.)
+    response.catch(() => {
+      if (streamRequest === request) cancel('buffering');
+    });
   }
-  return nativeFetch.call(this, input, ...rest);
+  return response;
 };
 
 document.addEventListener('datastar-fetch', (e) => {
   const { type, el } = e.detail;
   if (!el || el.id !== 'dsh-stream') return;
-  if (type === 'retrying' || type === 'error') {
+  if (type === 'finished') {
+    // Datastar has given up on the stream, one way or another.
+    cancel('buffering');
+  } else if (type === 'retrying' || type === 'error') {
     setConnected(false);
   } else if (type === 'retries-failed') {
     setConnected(false);
@@ -289,6 +310,9 @@ watcher({
   apply(_ctx, args) {
     switch (args.type) {
       case 'connected':
+      // The stream is up, though the app failed to start on it; the
+      // notification sent with this says why.
+      case 'failed':
         setConnected(true);
         break;
       case 'busy':

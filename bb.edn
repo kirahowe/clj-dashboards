@@ -20,11 +20,11 @@
 
   examples
   {:doc "Serve the example apps at http://localhost:8080/ (extra args go to the server, e.g. --port 3000)"
-   :task (apply shell "clojure -M:examples" *command-line-args*)}
+   :task (apply tasks/run-server "clojure -M:examples" *command-line-args*)}
 
   serve
   {:doc "Run the dashboards server, e.g. bb serve --app examples/apps/hello (bb serve --help)"
-   :task (apply shell "clojure -M:serve" *command-line-args*)}
+   :task (apply tasks/run-server "clojure -M:serve" *command-line-args*)}
 
   docker:build
   {:doc "Build the server image, clj-dashboards (deploy/Dockerfile)"

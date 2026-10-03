@@ -2,6 +2,7 @@
   "Helpers for the tasks in bb.edn."
   (:require [babashka.fs :as fs]
             [babashka.http-client :as http]
+            [babashka.tasks :refer [shell]]
             [clojure.string :as str]))
 
 (def assets "core/resources/dashboards/assets")
@@ -34,3 +35,14 @@
 (defn clean []
   (doseq [d [".cpcache" "core/.cpcache" "server/.cpcache" "template/.cpcache" "template/target"]]
     (fs/delete-tree d)))
+
+(defn run-server
+  "Run a server command (`shell` arguments) in the foreground. Stopping
+  it with Ctrl-C or SIGTERM is the normal way out, so that ends the
+  task quietly; any other failure exits with the server's exit code."
+  [& args]
+  (let [{:keys [exit]} (apply shell {:continue true} args)]
+    ;; A JVM ends with 128 + the signal's number: 130 for SIGINT,
+    ;; 143 for SIGTERM.
+    (when-not (contains? #{0 130 143} exit)
+      (System/exit exit))))
