@@ -317,3 +317,10 @@ bb datastar:update 1.0.5 # vendor another Datastar release
 
 Datastar is vendored in `core/resources/dashboards/assets` (MIT; see
 `DATASTAR-LICENSE.md` there), so deployments need no CDN.
+
+## License
+
+MIT; see [LICENSE](LICENSE). Datastar, vendored in
+`core/resources/dashboards/assets`, is also MIT (see
+`DATASTAR-LICENSE.md` there). The penguins example data is from the
+palmerpenguins package (CC0).
