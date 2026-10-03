@@ -46,6 +46,7 @@
             [starfederation.datastar.clojure.api :as d*])
   (:import (java.io File)
            (java.net URLDecoder URLEncoder)
+           (java.util UUID)
            (java.util.concurrent Executors ScheduledExecutorService TimeUnit)
            (java.time LocalDateTime)
            (java.time.format DateTimeFormatter)))
@@ -99,6 +100,10 @@
 
 (defn- session-count [server-state] (count @(:sessions server-state)))
 
+;; A session whose stream has been acknowledged but whose app is still
+;; loading is "pending": `(:pending server-state)` maps its id to the
+;; latest signals the page has posted for it, applied once it starts.
+
 ;; A server's `:phase` moves from :running through :draining (failing
 ;; health checks, refusing new streams) and :closing (closing streams
 ;; and sessions) to :stopped.
@@ -115,15 +120,23 @@
 (defn- now [] (System/currentTimeMillis))
 
 (defn- end-session!
-  "Forget session `sid`, stop it and close its stream."
+  "Stop session `sid`, forget it and close its stream."
   [server-state sid]
-  (let [[old _] (swap-vals! (:sessions server-state) dissoc sid)]
-    (when-let [{:keys [session gen]} (get old sid)]
-      (swap! (:streams server-state) dissoc gen)
-      (session/close! session)
-      ;; Should the browser still be there, it reconnects and starts
-      ;; a new session.
-      (close-stream! gen))))
+  (when-let [s (:session (get @(:sessions server-state) sid))]
+    (try
+      ;; Closing marks the session closed before it runs the on-ended
+      ;; callbacks, and before it is forgotten here, so a reconnecting
+      ;; stream can't take it over meanwhile (see `attach!`).
+      (session/close! s)
+      (finally
+        (let [[old _] (swap-vals! (:sessions server-state)
+                                  #(if (identical? s (get-in % [sid :session])) (dissoc % sid) %))]
+          (when-let [{:keys [session gen]} (get old sid)]
+            (when (identical? s session)
+              (swap! (:streams server-state) dissoc gen)
+              ;; Should the browser still be there, it reconnects and
+              ;; starts a new session.
+              (close-stream! gen))))))))
 
 (defn- touch!
   "Note that the browser behind session `sid` is still there."
@@ -134,16 +147,39 @@
 (defn- attach!
   "Point session `s` at the stream `gen`, closing any earlier one: the
   browser has moved on from it, though the server may not have noticed
-  it go."
+  it go. Returns false, attaching nothing, if the session has ended or
+  is ending."
   [server-state s gen]
   (let [sid (:id s)
-        [old _] (swap-vals! (:sessions server-state) assoc sid {:session s :gen gen :seen (now)})
-        old-gen (get-in old [sid :gen])]
-    (swap! (:streams server-state) assoc gen sid)
-    (session/set-transport! s (fn [msg] (datastar/send! gen msg)))
-    (when (and old-gen (not= old-gen gen))
-      (swap! (:streams server-state) dissoc old-gen)
-      (close-stream! old-gen))))
+        send (fn [msg] (datastar/send! gen msg))
+        entry {:session s :gen gen :send send :seen (now)}
+        ;; Checked inside the swap: `end-session!` marks the session
+        ;; closed before it forgets it, so either this sees the mark,
+        ;; or `end-session!` forgets this entry and closes `gen`.
+        [old new] (swap-vals! (:sessions server-state)
+                              #(if (session/closed? s) % (assoc % sid entry)))]
+    (if-not (identical? entry (get new sid))
+      false
+      (let [old-gen (get-in old [sid :gen])]
+        (swap! (:streams server-state) assoc gen sid)
+        (session/set-transport! s send)
+        (when (and old-gen (not= old-gen gen))
+          (swap! (:streams server-state) dissoc old-gen)
+          (close-stream! old-gen))
+        true))))
+
+(defn- detach!
+  "Stream `gen` has closed: stop its session sending to it -- unless a
+  newer stream has taken the session over already."
+  [server-state gen]
+  (let [[old _] (swap-vals! (:streams server-state) dissoc gen)
+        sid (get old gen)]
+    (when (string? sid)
+      (let [{:keys [session send] g :gen} (get @(:sessions server-state) sid)]
+        ;; Clears only the transport this stream installed, atomically:
+        ;; one a new stream has just attached is left alone.
+        (when (and session (= gen g))
+          (session/clear-transport! session send))))))
 
 (defn- housekeeping!
   "Run periodically: comment on every stream so proxies keep idle ones
@@ -157,6 +193,39 @@
             :when (< seen cutoff)]
       (end-session! server-state sid))))
 
+(defn- start-session!
+  "Start a new session on stream `gen`, acknowledging the stream before
+  the app is resolved: loading an app (a namespace to require, an
+  `app.clj`, its deps) can take a while, and the page takes a long wait
+  for the acknowledgement as a sign that a proxy is buffering the
+  stream. Returns the attached session, or nil if there is none to
+  carry on with."
+  [server-state mount req gen signals]
+  (let [sid (str (UUID/randomUUID))
+        pending (:pending server-state)]
+    (swap! pending assoc sid signals)
+    (try
+      ;; Tracked while the app loads, so it gets keep-alives, `stop!`
+      ;; closes it, and its closing is noticed.
+      (swap! (:streams server-state) update gen #(or % ::loading))
+      (datastar/send! gen (session/connected-message sid))
+      (let [s (session/start! (apps/resolve-app (:source mount))
+                              {:id sid
+                               :request (dissoc req :async-channel :body)
+                               :sanitize-errors? (:sanitize-errors? (:config server-state))})]
+        (if (and (contains? @(:streams server-state) gen) (attach! server-state s gen))
+          ;; The latest signals posted while the app loaded (see
+          ;; `receive-signals`), else those the stream opened with.
+          ;; Taken after attaching, so that later posts find the session.
+          (let [[old _] (swap-vals! pending dissoc sid)]
+            (session/resend-outputs! s)
+            (session/receive! s (get old sid signals))
+            s)
+          ;; The stream closed while the app loaded: the browser has
+          ;; gone, or reconnected and started another session.
+          (do (session/close! s) nil)))
+      (finally (swap! pending dissoc sid)))))
+
 (defn- stream
   "The session's event stream. Opening it starts a session -- or
   resumes the one named in the signals, after a reconnect."
@@ -169,7 +238,8 @@
       (not (running? server-state))
       {:status 503 :headers {"Content-Type" "text/plain" "Retry-After" "1"} :body "Shutting down"}
 
-      (and (nil? existing) max-sessions (>= (session-count server-state) max-sessions))
+      (and (nil? existing) max-sessions
+           (>= (+ (session-count server-state) (count @(:pending server-state))) max-sessions))
       {:status 503 :headers {"Content-Type" "text/plain"} :body "At capacity"}
 
       :else
@@ -182,22 +252,25 @@
             ;; Opened just as the server began closing streams.
             (close-stream! gen)
             (try
-              (let [s (or (when (and existing (not (session/closed? existing))) existing)
-                          (session/start! (apps/resolve-app (:source mount))
-                                          {:request (dissoc req :async-channel :body)
-                                           :sanitize-errors? sanitize-errors?}))]
-                ;; Acknowledge the stream first, straight onto it: the
-                ;; page counts the wait for this, and a session busy
-                ;; running an observer would hold up anything sent
-                ;; through it.
-                (datastar/send! gen (session/connected-message s))
-                (attach! server-state s gen)
-                (if (closing? server-state)
+              ;; Acknowledge the stream first, straight onto it: the
+              ;; page counts the wait for this, and a session busy
+              ;; running an observer would hold up anything sent
+              ;; through it.
+              (let [s (if (and existing (not (session/closed? existing)))
+                        (do (datastar/send! gen (session/connected-message existing))
+                            (if (attach! server-state existing gen)
+                              (do (session/resend-outputs! existing)
+                                  (session/receive! existing signals)
+                                  existing)
+                              ;; It ended just as the browser reconnected
+                              ;; to it: start over from the page's
+                              ;; signals, under a new id.
+                              (start-session! server-state mount req gen signals)))
+                        (start-session! server-state mount req gen signals))]
+                (when (and s (closing? server-state))
                   ;; `stop!` began closing streams and sessions while
                   ;; this one was opening, and may have missed it.
-                  (end-session! server-state (:id s))
-                  (do (session/resend-outputs! s)
-                      (session/receive! s signals))))
+                  (end-session! server-state (:id s))))
               (catch Throwable t
                 (log "failed to start session for" (:path mount) "-" (ex-message t))
                 ;; Stops the page waiting for `connected`, so no
@@ -209,19 +282,14 @@
                 ;; Left open, as closing it would have the browser
                 ;; retry (and fail) over and over; but tracked, so it
                 ;; gets keep-alives and `stop!` closes it.
-                (swap! (:streams server-state) update gen #(or % ::no-session))
+                (swap! (:streams server-state) update gen #(if (string? %) % ::no-session))
                 (when (closing? server-state) (close-stream! gen))))))
         ;; Not every server reports a client going away from a
         ;; streaming response, so the session isn't ended here: the
         ;; browser's heartbeat and close beacon decide (see
         ;; `housekeeping!`).
         sse/on-close
-        (fn [gen & _]
-          (let [[old _] (swap-vals! (:streams server-state) dissoc gen)
-                sid (get old gen)]
-            (when (and sid (= gen (get-in @(:sessions server-state) [sid :gen])))
-              (some-> (get-in @(:sessions server-state) [sid :session])
-                      (session/set-transport! nil)))))}))))
+        (fn [gen & _] (detach! server-state gen))}))))
 
 (defn- read-body [req]
   (try (datastar/read-signals req) (catch Exception _ nil)))
@@ -232,10 +300,15 @@
   "A POST of the page's signals, after one of them changed."
   [server-state req]
   (let [signals (read-body req)
-        sid (get-in signals ["dsh" "session"])]
-    (when-let [s (some-> (get @(:sessions server-state) sid) :session)]
-      (touch! server-state sid)
-      (session/receive! s signals))
+        sid (get-in signals ["dsh" "session"])
+        ;; A session whose app is still loading takes them once it
+        ;; starts (see `start-session!`).
+        [pending _] (swap-vals! (:pending server-state)
+                                #(if (contains? % sid) (assoc % sid signals) %))]
+    (when-not (contains? pending sid)
+      (when-let [s (some-> (get @(:sessions server-state) sid) :session)]
+        (touch! server-state sid)
+        (session/receive! s signals)))
     no-content))
 
 (defn- download [server-state sid id]
@@ -394,6 +467,16 @@
   (let [p (str "/" (str/replace (str p) #"^/+|/+$" ""))]
     p))
 
+(defn- load-apps!
+  "Load every app mounted now, so that no page or stream waits for one
+  to load. An app that fails is logged and left for its first request
+  to report, as a broken app mustn't take the others down."
+  [server-state]
+  (doseq [{:keys [path source]} (sort-by :path (current-mounts server-state))]
+    (try (apps/resolve-app source)
+         (catch Throwable t
+           (log "failed to load the app at" path "-" (ex-message t))))))
+
 (defn start!
   "Start a server. Returns a server map; stop it with `stop!`.
 
@@ -424,6 +507,11 @@
     `/_health` before it closes the open streams (default 0). See
     `stop!`.
 
+  Every app in `:apps`, and every one already in `:apps-dir`, is loaded
+  before the server starts listening, so that no page or stream waits
+  for one. An app that fails to load is logged and shows its error when
+  opened; the others are served as usual.
+
   `GET /_health` answers 200 with `{\"status\": \"ok\", \"sessions\": n}`
   while the server is running, and 503 with `{\"status\": \"draining\"}`
   once it is stopping; point load balancer health checks or a
@@ -440,6 +528,7 @@
                :static-mounts static-mounts
                :dir-sources (atom {})
                :sessions (atom {})
+               :pending (atom {})
                :streams (atom {})
                :phase (atom :running)
                :stopped (promise)
@@ -449,6 +538,7 @@
                                                (catch Throwable t (log "housekeeping failed:" (ex-message t))))
                                 (long (:keep-alive-ms config)) (long (:keep-alive-ms config))
                                 TimeUnit/MILLISECONDS)
+        _ (load-apps! state)
         stop-fn (http/run-server (handler state)
                                  {:port (:port config)
                                   :ip (:host config)
@@ -500,10 +590,15 @@
            stop-housekeeping! #(step "stopping housekeeping"
                                      (fn [] (.shutdownNow ^ScheduledExecutorService (:scheduler server))))]
        (try
-         (let [delay-ms (or (:shutdown-delay-ms opts) (:shutdown-delay-ms (:config server)) 0)]
-           (when (pos? delay-ms)
-             (step "draining"
-                   (fn []
+         (step "draining"
+               (fn []
+                 (let [delay-ms (or (:shutdown-delay-ms opts) (:shutdown-delay-ms (:config server)) 0)]
+                   ;; From a config file, so possibly anything.
+                   (when-not (and (number? delay-ms) (not (neg? delay-ms)))
+                     (throw (ex-info (str ":shutdown-delay-ms should be a number of milliseconds, not "
+                                          (pr-str delay-ms))
+                                     {:shutdown-delay-ms delay-ms})))
+                   (when (pos? delay-ms)
                      (log (str "draining: /_health reports 503; closing " (count @(:streams server))
                                " stream(s) in " delay-ms "ms"))
                      (Thread/sleep (long delay-ms))))))

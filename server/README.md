@@ -39,7 +39,10 @@ An app source can be an app value, a var (re-read for each page load), a
 qualified symbol, or a directory containing `app.clj`. Directories reload
 when their files change, and a `deps.edn` beside `app.clj` can add
 libraries at load time (the server must run under the Clojure CLI for
-this).
+this). The server loads every app it is given, and every one already in
+`--apps-dir`, before it starts listening, so the first visitors don't
+wait for them; an app that fails to load is logged and shows its error
+when opened, while the rest are served as usual.
 
 ```clojure
 io.github.kirahowe/dashboards-server

@@ -302,24 +302,38 @@
                  :outputs (atom {})
                  :downloads (atom {})
                  :on-ended (atom [])
+                 :ended (atom false)
                  :started (atom false)}]
     (deliver session-p session)
     session))
+
+(defn- drop-message [_])
 
 (defn set-transport!
   "Send through `send!` from now on (after the browser reconnects,
   say). Pass nil to drop messages while no browser is connected."
   [session send!]
-  (reset! (:transport session) (or send! (fn [_]))))
+  (reset! (:transport session) (or send! drop-message)))
+
+(defn clear-transport!
+  "Drop messages from now on, as `(set-transport! session nil)` does,
+  but only if the session is still sending through `send!` (the very
+  function given to `set-transport!`): a stream closing must not take
+  the transport from a newer one that has just replaced it. Returns
+  whether it did."
+  [session send!]
+  (compare-and-set! (:transport session) send! drop-message))
 
 (defn connected-message
   "The message that tells a browser which session it is talking to:
   `{:type \"connected\" :session id}`. The hosting layer writes it
   straight onto each stream as the stream (re)opens, before handing
   the stream to the session with `set-transport!`, so that it arrives
-  at once even while the session is busy running an observer."
-  [session]
-  {:type "connected" :session (:id session)})
+  at once even while the session is busy running an observer. Takes
+  the session, or the id one is about to start with (see `start!`'s
+  `:id`), so a stream can be acknowledged before its app has loaded."
+  [session-or-id]
+  {:type "connected" :session (if (map? session-or-id) (:id session-or-id) session-or-id)})
 
 (defn resend-outputs!
   "Send every output the browser may have missed, on the session's
@@ -357,15 +371,18 @@
     (r/submit-sync! (:domain session)
                     #(r/isolate (render/download-content spec)))))
 
-(defn closed? [session] (r/closed? (:domain session)))
+(defn closed?
+  "Whether the session has ended, or is ending: true from the moment
+  `close!` is first called, before its `on-ended` callbacks run."
+  [session]
+  (or @(:ended session) (r/closed? (:domain session))))
 
 (defn close!
-  "End the session: run its `on-ended` callbacks and stop its
-  observers."
+  "End the session: mark it closed (see `closed?`), run its `on-ended`
+  callbacks and stop its observers. Only the first call does anything."
   [session]
-  (let [domain (:domain session)]
-    (when-not (r/closed? domain)
-      (doseq [f @(:on-ended session)]
-        (try (binding [*session* session] (f))
-             (catch Throwable t (log-error session "on-ended callback" t))))
-      (r/close-domain! domain))))
+  (when (compare-and-set! (:ended session) false true)
+    (doseq [f @(:on-ended session)]
+      (try (binding [*session* session] (f))
+           (catch Throwable t (log-error session "on-ended callback" t))))
+    (r/close-domain! (:domain session))))

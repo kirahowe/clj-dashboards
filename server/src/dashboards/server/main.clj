@@ -74,15 +74,22 @@
           ("-h" "--help") (recur more (assoc opts :help? true))
           (throw (ex-info (str "Unknown option: " a) {:arg a})))))))
 
-(defn- env-config []
-  (let [env #(not-empty (System/getenv %))
-        number #(whole-number (str "$" %) (env %))]
+(def ^:private env-numbers
+  "Config keys read from the environment as numbers, and their variables."
+  {:port "PORT" :shutdown-delay-ms "DASHBOARDS_SHUTDOWN_DELAY_MS"})
+
+(defn- env-config
+  "Config from the environment (`getenv`, a function of a variable
+  name), numbers still as strings: only those that are used are parsed
+  (see `config-from`), so that a flag can stand in for a bad one."
+  [getenv]
+  (let [env #(not-empty (getenv %))]
     (cond-> {}
-      (env "PORT") (assoc :port (number "PORT"))
+      (env "PORT") (assoc :port (env "PORT"))
       (env "HOST") (assoc :host (env "HOST"))
       (env "DASHBOARDS_BASE_PATH") (assoc :base-path (env "DASHBOARDS_BASE_PATH"))
       (env "DASHBOARDS_APPS_DIR") (assoc :apps-dir (env "DASHBOARDS_APPS_DIR"))
-      (env "DASHBOARDS_SHUTDOWN_DELAY_MS") (assoc :shutdown-delay-ms (number "DASHBOARDS_SHUTDOWN_DELAY_MS"))
+      (env "DASHBOARDS_SHUTDOWN_DELAY_MS") (assoc :shutdown-delay-ms (env "DASHBOARDS_SHUTDOWN_DELAY_MS"))
       (env "DASHBOARDS_CONFIG") (assoc :config-file (env "DASHBOARDS_CONFIG")))))
 
 (defn- read-config-file [path]
@@ -90,15 +97,25 @@
     ;; Apps in a config file name vars as symbols: {:app my.ns/app}.
     cfg))
 
-(defn config-from [args]
-  (let [cli (parse-args args)
-        env (env-config)
-        file (or (:config-file cli) (:config-file env))
-        from-file (when file (read-config-file file))
-        merged (merge env from-file (dissoc cli :config-file))]
-    (cond-> (dissoc merged :config-file :help?)
-      (and (:apps from-file) (:apps cli)) (assoc :apps (into (vec (:apps from-file)) (:apps cli)))
-      (:help? cli) (assoc :help? true))))
+(defn config-from
+  "The server config from command-line `args`, the config file and the
+  environment (`getenv`, default `System/getenv`)."
+  ([args] (config-from args #(System/getenv ^String %)))
+  ([args getenv]
+   (let [cli (parse-args args)
+         env (env-config getenv)
+         file (or (:config-file cli) (:config-file env))
+         from-file (when file (read-config-file file))
+         merged (merge env from-file (dissoc cli :config-file))
+         ;; Numbers from the environment that nothing overrides.
+         merged (reduce-kv (fn [m k var]
+                             (if (and (contains? env k) (identical? (get env k) (get m k)))
+                               (assoc m k (whole-number (str "$" var) (get env k)))
+                               m))
+                           merged env-numbers)]
+     (cond-> (dissoc merged :config-file :help?)
+       (and (:apps from-file) (:apps cli)) (assoc :apps (into (vec (:apps from-file)) (:apps cli)))
+       (:help? cli) (assoc :help? true)))))
 
 (defn -main [& args]
   (let [config (try (config-from args)

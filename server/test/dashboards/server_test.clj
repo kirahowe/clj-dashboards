@@ -8,6 +8,7 @@
             [dashboards.server :as server]
             [dashboards.server.apps :as apps]
             [dashboards.server.main :as main]
+            [dashboards.session :as session]
             [dashboards.ui :as ui])
   (:import (java.net URI URLEncoder)
            (java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers)
@@ -38,6 +39,20 @@
     (resolve-app [_] (throw (ex-info "the app is broken" {})))
     (source-dir [_] nil)))
 
+(def ending
+  "While set, `{:entered p :release p}`: the on-ended callbacks of
+  `ending-app`'s sessions deliver `entered`, then wait for `release`."
+  (atom nil))
+
+(def ending-app
+  (app/app {:ui (ui/page (ui/numeric-input :n "N" {:value 1}) (ui/text-output :sq))
+            :server (fn [{:keys [input session]}]
+                      (session/on-ended session
+                                        #(when-let [{:keys [entered release]} @ending]
+                                           (deliver entered true)
+                                           (deref release 10000 nil)))
+                      {:sq (render/text (let [n (input :n 0)] (* n n)))})}))
+
 (def ^:dynamic *server* nil)
 
 (defn- start-server [config]
@@ -45,7 +60,8 @@
                          :apps [{:path "/" :app counter-app}
                                 {:path "/other" :app counter-app}
                                 {:path "/slow" :app slow-app}
-                                {:path "/broken" :app broken-app}]}
+                                {:path "/broken" :app broken-app}
+                                {:path "/ending" :app ending-app}]}
                         config)))
 
 (use-fixtures :each
@@ -399,3 +415,159 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"^--\S+ (expects a whole number|needs a value)"
                             (main/config-from (into ["--app" "my.ns/app"] args)))
           (pr-str args)))))
+
+;; ---------------------------------------------------------------------------
+;; Loading apps, and races between streams and sessions
+
+(defn- temp-dir []
+  (.toFile (Files/createTempDirectory "dashboards" (make-array FileAttribute 0))))
+
+(def loads "How many times the test app directories have been loaded." (atom 0))
+
+(defn- write-app!
+  "Write an app directory `dir` whose app.clj takes `sleep-ms` to load."
+  [dir sleep-ms]
+  (.mkdirs (io/file dir))
+  (spit (io/file dir "app.clj")
+        (str "(ns slow-load.app (:require [dashboards.app :as app] [dashboards.ui :as ui]"
+             " [dashboards.render :as render]))\n"
+             "(swap! dashboards.server-test/loads inc)\n"
+             "(Thread/sleep " sleep-ms ")\n"
+             "(app/app {:title \"Slow to load\""
+             " :ui (ui/page (ui/numeric-input :n \"N\" {:value 1}) (ui/text-output :sq))"
+             " :server (fn [{:keys [input]}] {:sq (render/text (let [n (input :n 0)] (* n n)))})})\n")))
+
+(deftest the-connection-is-acknowledged-before-the-app-loads
+  ;; An app that appears after the server started, as in a rolling
+  ;; deploy's first requests for it, loads when it is first opened.
+  (let [root (temp-dir)
+        s (server/start! {:port 0 :host "127.0.0.1" :apps-dir (str root)})]
+    (try
+      (binding [*server* s]
+        (write-app! (io/file root "late") 3000)
+        (let [t0 (System/nanoTime)
+              c (open-stream {"n" "3" "dsh" {"session" "" "kinds" {"n" "number"}}} "/late")]
+          (try
+            (let [sid (session-of (await-event c connected? 1000))
+                  ms (/ (- (System/nanoTime) t0) 1e6)]
+              (is (string? sid) "the stream is acknowledged...")
+              (is (< ms 1000) (str "...at once, not after the app loads (" ms "ms)"))
+              (testing "signals posted while the app loads are applied once it has"
+                (is (= 204 (post-signals {"n" "5" "dsh" {"session" sid "kinds" {"n" "number"}}} "/late")))
+                (is (str/includes? (get-in (await-event c (output-for "sq") 10000) [:data "elements"]) ">25<")))
+              (is (= 1 (sessions))))
+            (finally ((:close c))))))
+      (finally (server/stop! s)))))
+
+(deftest apps-load-as-the-server-starts
+  (let [root (temp-dir)
+        resolved (atom 0)
+        counting (reify apps/AppSource
+                   (resolve-app [_] (swap! resolved inc) counter-app)
+                   (source-dir [_] nil))
+        _ (write-app! (io/file root "found") 0)
+        before @loads
+        s (server/start! {:port 0 :host "127.0.0.1" :apps-dir (str root)
+                          :apps [{:path "/counting" :app counting}
+                                 {:path "/broken" :app broken-app}]})]
+    (try
+      (binding [*server* s]
+        (is (pos? @resolved) "configured apps are resolved before any request")
+        (is (= (inc before) @loads) "as are those in the apps directory")
+        (is (= 200 (:status (http-get "/_health"))) "and a broken one doesn't stop the server")
+        (is (str/includes? (:body (http-get "/found/")) "Slow to load"))
+        (is (= (inc before) @loads) "which doesn't load them again"))
+      (finally (server/stop! s)))))
+
+(deftest reconnecting-to-a-session-as-it-ends
+  (let [entered (promise)
+        release (promise)]
+    (reset! ending {:entered entered :release release})
+    (try
+      (let [c (open-stream {"n" "2" "dsh" {"session" "" "kinds" {"n" "number"}}} "/ending")
+            sid (session-of (await-event c connected?))
+            closed? session/closed?
+            closing (promise)
+            srv *server*]
+        (await-event c (output-for "sq"))
+        ((:close c))
+        ;; The browser reconnects. Just as the new stream checks the
+        ;; session it names, the page's close beacon (say) starts ending
+        ;; that session, which is held running its on-ended callbacks.
+        (with-redefs-fn {#'session/closed?
+                         (fn [s]
+                           (when (and (= sid (:id s)) (not (realized? closing)))
+                             (deliver closing (future (binding [*server* srv]
+                                                        (post "/ending/_dashboards/close" {"session" sid}))))
+                             (deref entered 5000 nil))
+                           (closed? s))}
+          (fn []
+            (let [c2 (open-stream {"n" "3" "dsh" {"session" sid "kinds" {"n" "number"}}} "/ending")]
+              (try
+                (let [sid2 (session-of (await-event c2 connected?))]
+                  (is (realized? entered) "the session was ending as the stream opened")
+                  (is (not= sid sid2) "the browser gets a fresh session, not the ending one")
+                  (deliver release true)
+                  (is (= 204 (deref @closing 5000 ::timeout)))
+                  (is (str/includes? (get-in (await-event c2 (output-for "sq")) [:data "elements"]) ">9<")
+                      "which starts from the page's signals")
+                  (is (= [sid2] (keys @(:sessions *server*))) "and the ended one is gone")
+                  (is (not (ended-within? c2 300)) "its stream stays open"))
+                (finally ((:close c2))))))))
+      (finally (deliver release true) (reset! ending nil)))))
+
+(deftest attaching-to-an-ended-session-is-refused
+  (let [attach! @#'server/attach!
+        s (session/start! counter-app {})]
+    (session/close! s)
+    (is (false? (attach! *server* s ::gen)))
+    (is (empty? @(:sessions *server*)))
+    (is (not (contains? @(:streams *server*) ::gen)))))
+
+(deftest a-closing-stream-leaves-a-newer-one-its-transport
+  ;; The browser reconnects just as the server notices the old stream
+  ;; close: the new stream attaches between the old one's check and its
+  ;; clearing of the transport.
+  (let [attach! @#'server/attach!
+        clear! session/clear-transport!
+        c (open-stream {"dsh" {"session" ""}})
+        sid (session-of (await-event c connected?))
+        s (get-in @(:sessions *server*) [sid :session])
+        raced (promise)
+        srv *server*]
+    (with-redefs-fn {#'session/clear-transport!
+                     (fn [session send!]
+                       (when-not (realized? raced)
+                         (deliver raced (attach! srv session ::new-stream)))
+                       (clear! session send!))}
+      (fn []
+        ((:close c))
+        (is (true? (deref raced 5000 ::timeout)) "the old stream's close is noticed")
+        (Thread/sleep 100)))
+    (is (= (get-in @(:sessions *server*) [sid :send]) @(:transport s))
+        "the session still sends to the new stream")
+    (swap! (:streams *server*) dissoc ::new-stream)))
+
+(deftest a-bad-shutdown-delay-doesnt-stop-stop!
+  (let [s (start-server {:shutdown-delay-ms "5s"})
+        c (binding [*server* s] (open-stream {"dsh" {"session" ""}}))]
+    (try
+      (session-of (await-event c connected?))
+      (is (nil? (deref (future (server/stop! s)) 5000 ::timeout)) "stop! returns")
+      (is (ended-within? c 2000) "streams are closed")
+      (is (= 0 (count @(:sessions s))) "sessions end")
+      (is (not (listening? s)) "the HTTP server is stopped")
+      (finally ((:close c)) (server/stop! s)))))
+
+(deftest environment-variables
+  (let [env (fn [m] #(get m %))]
+    (is (= 9000 (:port (main/config-from ["--app" "my.ns/app"] (env {"PORT" "9000"})))))
+    (is (= 3000 (:port (main/config-from ["--app" "my.ns/app" "--port" "3000"] (env {"PORT" "http"}))))
+        "a flag stands in for a bad variable")
+    (is (= 10 (:shutdown-delay-ms (main/config-from ["--app" "my.ns/app" "--shutdown-delay-ms" "10"]
+                                                    (env {"DASHBOARDS_SHUTDOWN_DELAY_MS" "soon"})))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"^\$PORT expects a whole number"
+                          (main/config-from ["--app" "my.ns/app"] (env {"PORT" "http"})))
+        "a bad variable that is used is refused")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"^\$DASHBOARDS_SHUTDOWN_DELAY_MS expects"
+                          (main/config-from ["--app" "my.ns/app"] (env {"DASHBOARDS_SHUTDOWN_DELAY_MS" "-5"}))))))
