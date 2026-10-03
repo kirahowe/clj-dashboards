@@ -40,13 +40,14 @@ qualified symbol, or a directory containing `app.clj`. Directories reload
 when their files change, and a `deps.edn` beside `app.clj` can add
 libraries at load time (the server must run under the Clojure CLI for
 this). The server listens at once, then loads every app it is given, and
-every one already in `--apps-dir`, in the background, so the first
-visitors don't wait for them; `/_health` reports `"starting"` (503)
-until each has loaded, failed, or run out of time
+every one already in `--apps-dir`, in the background and one at a time,
+so the first visitors don't wait for them; `/_health` reports
+`"starting"` (503) until each has loaded, failed, or run out of time
 (`:app-load-timeout-ms`, default 60000). A request for an app still
 loading waits no longer than that. An app that fails or runs out of time
 is logged and shows its error when opened, while the rest are served as
-usual.
+usual; a hung `app.clj` delays the apps loaded after it until the
+timeout interrupts it.
 
 ```clojure
 io.github.kirahowe/dashboards-server

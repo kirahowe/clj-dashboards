@@ -13,7 +13,11 @@
     the app (or to a var holding it). When any `.clj` file in the
     directory changes, the app is reloaded for new sessions. An
     optional `deps.edn` beside it may list extra `:deps`, which are
-    added to the running server when the app loads."
+    added to the running server when the app loads.
+
+  Clojure's `require` isn't thread-safe, so symbols and directories
+  load one at a time: under Clojure's own require lock, the one
+  `requiring-resolve` takes (see `serialized`)."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
@@ -42,10 +46,34 @@
   (resolve-app [_] (ensure-app @v (str v)))
   (source-dir [_] nil))
 
+(def ^:dynamic *on-load-phase*
+  "When bound, a function `serialized` calls with `:waiting` just
+  before it waits for the require lock, and with `:loading` once it
+  holds it -- so that a caller can time the load itself, not the wait."
+  nil)
+
+(defn serialized
+  "Call `f` holding Clojure's require lock (`clojure.lang.RT/REQUIRE_LOCK`,
+  the one `requiring-resolve` takes), so that it loads code one at a
+  time with every other caller, and every serialized require. Throws
+  InterruptedException, without calling `f`, if the thread was
+  interrupted while it waited."
+  [f]
+  (if (Thread/holdsLock clojure.lang.RT/REQUIRE_LOCK)
+    (f)
+    (do (when-let [on-phase *on-load-phase*] (on-phase :waiting))
+        (locking clojure.lang.RT/REQUIRE_LOCK
+          ;; Waiting for a monitor can't be interrupted, so look now.
+          (when (Thread/interrupted)
+            (throw (InterruptedException. "interrupted while waiting to load")))
+          (when-let [on-phase *on-load-phase*] (on-phase :loading))
+          (f)))))
+
 (defrecord SymbolSource [sym]
   AppSource
   (resolve-app [_]
-    (let [v (or (requiring-resolve sym)
+    (let [v (or (resolve sym)
+                (serialized #(requiring-resolve sym))
                 (throw (ex-info (str "Could not resolve " sym) {:symbol sym})))]
       (ensure-app @v (str sym))))
   (source-dir [_] nil))
@@ -82,28 +110,36 @@
                             {:deps deps} t))))))))
 
 (defn load-app-dir
-  "Load `dir/app.clj` and return the app it evaluates to."
+  "Load `dir/app.clj` and return the app it evaluates to (see
+  `serialized`)."
   [^File dir]
-  (add-app-deps! dir)
-  (let [file (io/file dir "app.clj")
-        result (binding [app/*app-dir* (.getAbsoluteFile dir)
-                         *ns* *ns*]
-                 (load-file (.getPath file)))]
-    (ensure-app result (str file))))
+  (serialized
+   (fn []
+     (add-app-deps! dir)
+     (let [file (io/file dir "app.clj")
+           result (binding [app/*app-dir* (.getAbsoluteFile dir)
+                            *ns* *ns*]
+                    (load-file (.getPath file)))]
+       (ensure-app result (str file))))))
 
 (defrecord DirSource [^File dir state reload?]
   AppSource
   (resolve-app [_]
-    (locking state
-      (let [{:keys [app fp]} @state]
-        (if (and app (or (not reload?) (= fp (fingerprint dir))))
-          app
-          (let [fp (fingerprint dir)
-                app (load-app-dir dir)]
-            (when (:app @state)
-              (println "dashboards: reloaded" (str dir)))
-            (reset! state {:app app :fp fp})
-            app)))))
+    (let [current #(let [{:keys [app fp]} @state]
+                     (when (and app (or (not reload?) (= fp (fingerprint dir)))) app))]
+      ;; Only (re)loading takes the lock: an app already loaded is
+      ;; served even while another app loads.
+      (or (current)
+          (serialized
+           (fn []
+             ;; Loaded by whoever held the lock before.
+             (or (current)
+                 (let [fp (fingerprint dir)
+                       app (load-app-dir dir)]
+                   (when (:app @state)
+                     (println "dashboards: reloaded" (str dir)))
+                   (reset! state {:app app :fp fp})
+                   app)))))))
   (source-dir [_] dir))
 
 (defn dir-source [dir & {:keys [reload?] :or {reload? true}}]
