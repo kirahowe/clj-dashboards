@@ -6,12 +6,12 @@
         ;; For writing the app: UI, reactivity, rendering.
         io.github.kirahowe/dashboards-core
         {:git/url "https://github.com/kirahowe/clj-dashboards"
-         :git/sha "937ff7e84ae6c7bacc4d19861b936944604fedd2"
+         :git/sha "e8f644871dcce781565dabcda2528a06728b6cfd"
          :deps/root "core"}
         ;; For serving it. Only the infrastructure needs this.
         io.github.kirahowe/dashboards-server
         {:git/url "https://github.com/kirahowe/clj-dashboards"
-         :git/sha "937ff7e84ae6c7bacc4d19861b936944604fedd2"
+         :git/sha "e8f644871dcce781565dabcda2528a06728b6cfd"
          :deps/root "server"}}
 
  :aliases
