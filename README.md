@@ -210,7 +210,7 @@ HTTP, with no websockets.
   stream drops simply reopens it and carries on in the same session.
   Because the inputs live in the browser, a page outlives even a server
   restart: it reconnects to a fresh session that starts from the inputs
-  the page already has. A drop that is back within about 1.5 seconds
+  the page already has. A drop that is back within about 2.5 seconds
   goes unnoticed; a longer one shows *Reconnecting…* until the stream
   returns.
 - **Session lifetime:** a session lives as long as its page sends a
@@ -293,16 +293,19 @@ through `receive!`.
 
 `bb serve --help` lists them. The options are
 `--app [PATH=]APP` (repeatable), `--apps-dir`, `--config FILE`, `--port`,
-`--host`, `--base-path`, `--title`, `--no-reload`, `--sanitize-errors`
-and `--max-sessions`. A config file can also set `:session-timeout-ms`,
-`:keep-alive-ms` and `:shutdown-delay-ms`. The environment variables
-`PORT`, `HOST`, `DASHBOARDS_CONFIG`, `DASHBOARDS_APPS_DIR` and
-`DASHBOARDS_BASE_PATH` also work.
+`--host`, `--base-path`, `--title`, `--no-reload`, `--sanitize-errors`,
+`--max-sessions` and `--shutdown-delay-ms`. A config file can also set
+`:session-timeout-ms` and `:keep-alive-ms`. The environment variables
+`PORT`, `HOST`, `DASHBOARDS_CONFIG`, `DASHBOARDS_APPS_DIR`,
+`DASHBOARDS_BASE_PATH` and `DASHBOARDS_SHUTDOWN_DELAY_MS` also work.
 
 ### Running it in production
 
 Everything is ordinary HTTP, and every URL an app uses is relative, so
-it works behind any proxy and under any path prefix. Two things are
+it works behind any proxy and under any path prefix. (A proxy that
+strips the prefix should rewrite the one redirect the server sends,
+from `/<app>` to `/<app>/`, as [`deploy/nginx.conf`](deploy/nginx.conf)
+does; or leave the prefix on and set `--base-path`.) Two things are
 unusual: each open tab holds one long-lived response (its event stream,
 `_dashboards/stream`), and each tab's session lives in the memory of one
 server process. Most of what follows comes from those two facts.
@@ -359,12 +362,19 @@ one process, so it doesn't outlive a restart either, and each replica
 has its own. Keep anything that must outlast a deploy in a database.
 
 Point readiness checks at `/_health`. Behind a load balancer, set
-`:shutdown-delay-ms` long enough for it to see the 503 (a couple of
-health-check intervals) and shorter than the time the platform allows
+`:shutdown-delay-ms` (or `--shutdown-delay-ms`) to how long it takes to
+mark an instance unhealthy: its health-check interval times its
+unhealthy threshold, plus a little. Caddy as configured below checks
+every 5 seconds and drops an instance after one failure, so 6000 is
+enough. The delay must also stay below the time the platform allows
 between SIGTERM and killing the process: 10 seconds for `docker stop`
 and Cloud Run, 30 seconds by default on Kubernetes
-(`terminationGracePeriodSeconds`). 5000 suits most container setups.
-With a single instance and nothing to drain to, leave it at 0.
+(`terminationGracePeriodSeconds`). An AWS Application Load Balancer
+with its defaults (every 30 seconds, two failures) takes a minute to
+notice; shorten its interval and threshold, or rely on its
+deregistration delay (ECS deregisters a task before stopping it),
+rather than set a delay that long. With a single instance and nothing
+to drain to, leave it at 0.
 
 **More than one replica.** A tab's stream and its POSTs must reach the
 same instance, or its input changes go to a server that doesn't have
@@ -432,20 +442,26 @@ open responses at once.
   Fly.io and Render, run one instance per app unless you set up
   affinity yourself (on Fly.io, with `fly-replay`).
 - Fine: Google Cloud Run, with session affinity, at least one instance
-  kept running so pages don't wait for a JVM to start, and the request
+  kept running so pages don't wait for a JVM to start, the request
   timeout raised from its 5 minute default to the 60 minute maximum so
-  streams aren't cut needlessly:
-  `gcloud run services update SERVICE --session-affinity --min-instances 1 --timeout 3600`.
-  Cloud Run's affinity is best effort, so expect the occasional fresh
-  session.
+  streams aren't cut needlessly, and a higher concurrency limit. Every
+  open tab holds a request open, which counts against an instance's
+  concurrency (80 by default), and affinity gives way once an instance
+  is at that limit, so set it well above the tabs you expect per
+  instance (1000 at most):
+  `gcloud run services update SERVICE --session-affinity --min-instances 1 --timeout 3600 --concurrency 1000`.
+  Even then Cloud Run's affinity is best effort, so expect the
+  occasional fresh session.
 - Not a fit: AWS Lambda and other serverless functions. Invocations
   are short-lived (15 minutes at most on Lambda) and spread across
   instances, so a tab's POSTs don't reach the process holding its
   session.
-- Not a fit: Amazon API Gateway REST APIs in front of the server. By
-  default they buffer the whole response and give up after 29 seconds;
-  their streaming mode still ends a response after 15 minutes. Put an
-  Application Load Balancer in front instead.
+- Not worth it: Amazon API Gateway REST APIs in front of the server. By
+  default they buffer the whole response and give up after 29 seconds,
+  which no stream survives. Their response-streaming mode works (the
+  browser reconnects every 15 minutes), but it adds nothing here and
+  doesn't keep a browser on one instance. Put an Application Load
+  Balancer in front instead.
 
 ## Development
 
