@@ -80,7 +80,7 @@
                              (recur it event (update data k #(if % (str % "\n" v) (str v)))))
                            :else (recur it event data)))))
                    (catch Exception _ nil)))]
-    {:events q :close #(do (.close lines) (future-cancel reader))}))
+    {:events q :reader reader :close #(do (.close lines) (future-cancel reader))}))
 
 (defn- await-event [{:keys [^LinkedBlockingQueue events]} pred]
   (loop []
@@ -199,7 +199,63 @@
             (is (= 404 (:status (http-get "/demo/..%2Fapp.clj"))) "no escaping www/"))
           (finally (server/stop! s)))))))
 
+;; ---------------------------------------------------------------------------
+;; Shutdown
+
+(defn- ended-within?
+  "Whether the stream `c` reaches end-of-stream within `ms`."
+  [c ms]
+  (not= ::open (deref (:reader c) ms ::open)))
+
+(defn- status-and-body [path]
+  (let [{:keys [status body]} (http-get path)] [status body]))
+
+(deftest stopping-closes-streams-promptly
+  (let [s (start-server {})
+        c (binding [*server* s] (open-stream {"dsh" {"session" ""}}))]
+    (try
+      (session-of (await-event c connected?))
+      (let [t0 (System/nanoTime)
+            stopping (future (server/stop! s))]
+        (is (ended-within? c 2000) "the browser sees its stream end, and reconnects")
+        (let [ms (/ (- (System/nanoTime) t0) 1e6)]
+          ;; Well before http-kit's own stop timeout (1s).
+          (is (< ms 1000) (str "the stream ended " ms "ms after stop!")))
+        (is (nil? (deref stopping 5000 ::timeout))))
+      (testing "stop! is safe to call again"
+        (is (nil? (server/stop! s)))
+        (is (nil? (server/stop! s))))
+      (finally ((:close c)) (server/stop! s)))))
+
+(deftest draining-before-stopping
+  (let [s (start-server {:shutdown-delay-ms 1500})]
+    (binding [*server* s]
+      (let [c (open-stream {"n" "3" "dsh" {"session" "" "kinds" {"n" "number"}}})
+            sid (session-of (await-event c connected?))]
+        (await-event c (output-for "sq"))
+        (is (= [200 "ok"] (let [[st b] (status-and-body "/_health")] [st (get (json/read-json b) "status")])))
+        (let [stopping (future (server/stop! s))
+              second-stop (do (Thread/sleep 200) (future (server/stop! s)))]
+          (try
+            (testing "while draining"
+              (let [[status body] (status-and-body "/_health")]
+                (is (= 503 status) "the health check fails, so load balancers stop routing here")
+                (is (= "draining" (get (json/read-json body) "status"))))
+              (is (= 503 (:status (http-get (str "/_dashboards/stream?datastar="
+                                                  (URLEncoder/encode (json/write-json-str {"dsh" {"session" ""}}) "UTF-8")))))
+                  "new streams are refused")
+              (is (not (ended-within? c 300)) "open streams carry on for now")
+              (is (= 204 (post-signals {"n" "5" "dsh" {"session" sid "kinds" {"n" "number"}}})))
+              (is (str/includes? (get-in (await-event c (output-for "sq")) [:data "elements"]) ">25<")
+                  "existing sessions keep working"))
+            (testing "after the delay the stream closes and the server stops"
+              (is (ended-within? c 3000))
+              (is (nil? (deref stopping 5000 ::timeout)))
+              (is (nil? (deref second-stop 5000 ::timeout)) "a concurrent stop! waits and returns"))
+            (finally ((:close c)) (server/stop! s))))))))
+
 (deftest command-line
   (is (= {:apps [{:path "/" :app 'my.ns/app} {:path "/b" :app "./apps/b"}]
           :port 9000 :reload? false}
-         (main/config-from ["--app" "my.ns/app" "--app" "/b=./apps/b" "--port" "9000" "--no-reload"]))))
+         (main/config-from ["--app" "my.ns/app" "--app" "/b=./apps/b" "--port" "9000" "--no-reload"])))
+  (is (= 10000 (:shutdown-delay-ms (main/config-from ["--app" "my.ns/app" "--shutdown-delay-ms" "10000"])))))

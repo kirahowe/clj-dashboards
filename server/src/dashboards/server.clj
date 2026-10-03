@@ -13,6 +13,15 @@
   `:session-timeout-ms` ends, as does one whose page sends its close
   beacon on the way out.
 
+  Stopping the server (`stop!`, which the standalone server runs on
+  SIGTERM) drains it first: `/_health` answers 503 and new streams are
+  refused, then every open stream is closed so browsers reconnect at
+  once -- to another instance behind a load balancer, or to this one
+  once it is back. A reconnecting browser sends all of its inputs, so
+  a server that doesn't know its session starts a fresh one from
+  them; state kept only on the server is lost (see
+  `dashboards.session`).
+
   Apps don't depend on this namespace; it is the infrastructure that
   runs them, like Shiny Server is for Shiny apps. Use it three ways:
 
@@ -33,7 +42,8 @@
             [dashboards.server.apps :as apps]
             [dashboards.session :as session]
             [org.httpkit.server :as http]
-            [starfederation.datastar.clojure.adapter.http-kit :as sse])
+            [starfederation.datastar.clojure.adapter.http-kit :as sse]
+            [starfederation.datastar.clojure.api :as d*])
   (:import (java.io File)
            (java.net URLDecoder URLEncoder)
            (java.util.concurrent Executors ScheduledExecutorService TimeUnit)
@@ -89,6 +99,17 @@
 
 (defn- session-count [server-state] (count @(:sessions server-state)))
 
+;; A server's `:phase` moves from :running through :draining (failing
+;; health checks, refusing new streams) and :closing (closing streams
+;; and sessions) to :stopped.
+
+(defn- running? [server-state] (= :running @(:phase server-state)))
+
+(defn- closing? [server-state] (contains? #{:closing :stopped} @(:phase server-state)))
+
+(defn- close-stream! [gen]
+  (try (d*/close-sse! gen) (catch Throwable _ nil)))
+
 ;; Each session's stream is a Datastar SDK SSE generator (`gen`).
 
 (defn- now [] (System/currentTimeMillis))
@@ -138,6 +159,9 @@
         sid (get-in signals ["dsh" "session"])
         existing (some-> (get @(:sessions server-state) sid) :session)]
     (cond
+      (not (running? server-state))
+      {:status 503 :headers {"Content-Type" "text/plain" "Retry-After" "1"} :body "Shutting down"}
+
       (and (nil? existing) max-sessions (>= (session-count server-state) max-sessions))
       {:status 503 :headers {"Content-Type" "text/plain"} :body "At capacity"}
 
@@ -147,19 +171,22 @@
        {:headers {"Cache-Control" "no-cache, no-transform" "X-Accel-Buffering" "no"}
         sse/on-open
         (fn [gen]
-          (try
-            (let [s (or (when (and existing (not (session/closed? existing))) existing)
-                        (session/start! (apps/resolve-app (:source mount))
-                                        {:request (dissoc req :async-channel :body)
-                                         :sanitize-errors? sanitize-errors?}))]
-              (attach! server-state s gen)
-              (session/connected! s)
-              (session/receive! s signals))
-            (catch Throwable t
-              (log "failed to start session for" (:path mount) "-" (ex-message t))
-              (datastar/send! gen {:type "notification" :level "error" :duration nil
-                                   :message (str "The app could not start: "
-                                                 (if sanitize-errors? "see the server log." (ex-message t)))}))))
+          (if (closing? server-state)
+            ;; Opened just as the server began closing streams.
+            (close-stream! gen)
+            (try
+              (let [s (or (when (and existing (not (session/closed? existing))) existing)
+                          (session/start! (apps/resolve-app (:source mount))
+                                          {:request (dissoc req :async-channel :body)
+                                           :sanitize-errors? sanitize-errors?}))]
+                (attach! server-state s gen)
+                (session/connected! s)
+                (session/receive! s signals))
+              (catch Throwable t
+                (log "failed to start session for" (:path mount) "-" (ex-message t))
+                (datastar/send! gen {:type "notification" :level "error" :duration nil
+                                     :message (str "The app could not start: "
+                                                   (if sanitize-errors? "see the server log." (ex-message t)))})))))
         ;; Not every server reports a client going away from a
         ;; streaming response, so the session isn't ended here: the
         ;; browser's heartbeat and close beacon decide (see
@@ -312,8 +339,11 @@
             mounts (current-mounts server-state)]
         (cond
           (= uri "/_health")
-          {:status 200 :headers {"Content-Type" "application/json"}
-           :body (json/write-json-str {:status "ok" :sessions (session-count server-state)})}
+          (let [ok? (running? server-state)]
+            {:status (if ok? 200 503)
+             :headers {"Content-Type" "application/json" "Cache-Control" "no-store"}
+             :body (json/write-json-str {:status (if ok? "ok" "draining")
+                                         :sessions (session-count server-state)})})
 
           :else
           (if-let [[mount sub] (match-mount mounts uri)]
@@ -365,10 +395,19 @@
   - `:keep-alive-ms` -- how often idle streams get a comment, so that
     proxies keep them open, and timed-out sessions are ended (default
     20000).
-  - `:sanitize-errors?` -- don't show exception messages to users."
+  - `:sanitize-errors?` -- don't show exception messages to users.
+  - `:shutdown-delay-ms` -- how long `stop!` reports not-ready on
+    `/_health` before it closes the open streams (default 0). See
+    `stop!`.
+
+  `GET /_health` answers 200 with `{\"status\": \"ok\", \"sessions\": n}`
+  while the server is running, and 503 with `{\"status\": \"draining\"}`
+  once it is stopping; point load balancer health checks or a
+  Kubernetes readiness probe at it."
   [config]
   (let [config (merge {:port 8080 :host "0.0.0.0" :reload? true
-                       :session-timeout-ms 120000 :keep-alive-ms 20000}
+                       :session-timeout-ms 120000 :keep-alive-ms 20000
+                       :shutdown-delay-ms 0}
                       (into {} (remove (comp nil? val)) config))
         static-mounts (vec (for [{:keys [path app]} (:apps config)]
                              {:path (normalize-path (or path "/"))
@@ -378,6 +417,8 @@
                :dir-sources (atom {})
                :sessions (atom {})
                :streams (atom {})
+               :phase (atom :running)
+               :stopped (promise)
                :scheduler (Executors/newSingleThreadScheduledExecutor)}
         _ (.scheduleAtFixedRate ^ScheduledExecutorService (:scheduler state)
                                 ^Runnable #(try (housekeeping! state)
@@ -394,14 +435,54 @@
            :port (http/server-port stop-fn))))
 
 (defn stop!
-  "Stop a server started with `start!`, ending its sessions."
-  [server]
-  (.shutdownNow ^ScheduledExecutorService (:scheduler server))
-  (doseq [{:keys [session]} (vals @(:sessions server))]
-    (session/close! session))
-  (reset! (:sessions server) {})
-  @(http/server-stop! (:http server) {:timeout 1000})
-  nil)
+  "Stop a server started with `start!`, gracefully:
+
+  1. `/_health` starts answering 503 (`{\"status\": \"draining\"}`)
+     and new streams are refused with 503, so load balancers stop
+     sending browsers here. Everything else, including open streams
+     and their sessions, carries on.
+  2. After `:shutdown-delay-ms` (from `opts`, else the server's
+     config; default 0), every open stream is closed. Browsers
+     reconnect within a second -- to another instance, or to this one
+     after a restart -- and, as that server doesn't know them, start a
+     new session from the inputs they send.
+  3. Sessions end (running their `on-ended` callbacks) and the HTTP
+     server stops.
+
+  With no delay this takes moments, as at the REPL and in tests. In a
+  container, set the delay to how long your load balancer takes to
+  notice a failing health check (its interval times its failure
+  threshold, plus a little) -- 5000 to 10000 is typical behind
+  Kubernetes readiness probes -- and keep it well under the grace
+  period before the process is killed (30s in Kubernetes, 10s for
+  `docker stop`).
+
+  Safe to call more than once, and from several threads: later calls
+  wait for the first to finish. Returns nil."
+  ([server] (stop! server nil))
+  ([server opts]
+   (if (compare-and-set! (:phase server) :running :draining)
+     (try
+       (let [delay-ms (or (:shutdown-delay-ms opts) (:shutdown-delay-ms (:config server)) 0)]
+         (when (pos? delay-ms)
+           (log (str "draining: /_health reports 503; closing " (count @(:streams server))
+                     " stream(s) in " delay-ms "ms"))
+           (Thread/sleep (long delay-ms)))
+         (reset! (:phase server) :closing)
+         (.shutdownNow ^ScheduledExecutorService (:scheduler server))
+         (doseq [gen (keys @(:streams server))]
+           (close-stream! gen))
+         (doseq [sid (keys @(:sessions server))]
+           (end-session! server sid))
+         (some-> (http/server-stop! (:http server) {:timeout 1000}) deref)
+         ;; Any session a stream raced to start while we were closing.
+         (doseq [sid (keys @(:sessions server))]
+           (end-session! server sid)))
+       (finally
+         (reset! (:phase server) :stopped)
+         (deliver (:stopped server) true)))
+     @(:stopped server))
+   nil))
 
 (defonce ^:private dev-server (atom nil))
 

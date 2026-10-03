@@ -10,6 +10,20 @@
   transport. `dashboards.datastar` turns the messages into the
   Datastar SSE events the browser understands.
 
+  **What survives a reconnect.** Inputs live in the browser, as
+  Datastar signals, and every (re)connecting stream sends all of them.
+  So when a browser reconnects to a server that doesn't know its
+  session -- a different instance behind a load balancer, or this one
+  after a restart -- a fresh session starts from those inputs and
+  renders the same outputs. Anything kept only on the server for the
+  session does not survive that: a `reactive/value` created inside
+  the server function, or whatever an `observe-event` handler has
+  accumulated (a click count, an undo history), starts over, because
+  the server function runs again from scratch. Keep state that must
+  outlast a server in inputs, or outside the session (a database; a
+  value at the top level of the app's namespace lasts as long as the
+  process).
+
   **From the browser** come Datastar signal snapshots: a map of every
   signal on the page, string keys, as Datastar sends them. Each
   top-level signal is an input, except `dsh`, which carries the

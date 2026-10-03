@@ -28,7 +28,14 @@
   itself. Values and reactives created outside any session (at the
   top level of an app namespace, say) are shared by every session; a
   background thread writing to a shared value re-renders every open
-  session that reads it."
+  session that reads it.
+
+  Values created inside a session (in a server function, say) live in
+  that server process only. If the browser reconnects to another
+  instance, or to this one after a restart, its session starts afresh
+  from its inputs and such values start from their initial state
+  again -- as does everything an observer had done. Inputs survive,
+  because they live in the browser (see `dashboards.session`)."
   (:import (java.util.concurrent ConcurrentLinkedQueue ExecutorService Executors
                                  ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean AtomicLong)))
