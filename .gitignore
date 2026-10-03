@@ -6,3 +6,4 @@ target/
 node_modules/
 *.jar
 .DS_Store
+.claude/worktrees/
