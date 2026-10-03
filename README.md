@@ -294,10 +294,12 @@ through `receive!`.
 `bb serve --help` lists them. The options are
 `--app [PATH=]APP` (repeatable), `--apps-dir`, `--config FILE`, `--port`,
 `--host`, `--base-path`, `--title`, `--no-reload`, `--sanitize-errors`,
-`--max-sessions` and `--shutdown-delay-ms`. A config file can also set
-`:session-timeout-ms` and `:keep-alive-ms`. The environment variables
-`PORT`, `HOST`, `DASHBOARDS_CONFIG`, `DASHBOARDS_APPS_DIR`,
-`DASHBOARDS_BASE_PATH` and `DASHBOARDS_SHUTDOWN_DELAY_MS` also work.
+`--max-sessions`, `--shutdown-delay-ms` and `--app-load-timeout-ms`. A
+config file can also set `:session-timeout-ms` and `:keep-alive-ms`. The
+environment variables `PORT`, `HOST`, `DASHBOARDS_CONFIG`,
+`DASHBOARDS_APPS_DIR`, `DASHBOARDS_BASE_PATH`,
+`DASHBOARDS_SHUTDOWN_DELAY_MS` and `DASHBOARDS_APP_LOAD_TIMEOUT_MS` also
+work.
 
 ### Running it in production
 
@@ -343,11 +345,24 @@ read timeout. If something in your path is stricter, lower
 causes a reconnect: the browser reopens the stream and carries on in
 the same session.
 
+**Startup.** The server listens at once and loads its apps in the
+background, each on its own thread, logging how long each took.
+Until every app has loaded, failed, or run out of time
+(`:app-load-timeout-ms`, default 60000, or `--app-load-timeout-ms`),
+`/_health` answers 503 with `{"status": "starting", "loading": [...]}`,
+so readiness checks hold traffic back until the apps are warm. A
+request for an app still loading waits for it, up to that timeout;
+an app that fails or runs out of time is logged and reports its error
+when opened, while the others are served as usual. So an `app.clj` that
+hangs (on a database connection, say) only takes down itself. Give the
+timeout room for apps whose `deps.edn` fetches libraries on first start.
+
 **Deploys and shutdown.** When the server is stopped (SIGTERM, or
 `server/stop!`), it:
 
-1. answers 503 on `/_health` and to new streams, so load balancers stop
-   sending it new tabs;
+1. answers 503 on `/_health` (`"draining"`, even if it was still
+   starting) and to new streams, so load balancers stop sending it new
+   tabs;
 2. waits `:shutdown-delay-ms` (default 0) for them to notice;
 3. closes every open stream, so each browser reconnects straight away,
    to another instance or to this one once it's back;

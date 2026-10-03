@@ -23,9 +23,16 @@
                          $DASHBOARDS_SHUTDOWN_DELAY_MS); behind a load
                          balancer, its health-check interval times its
                          failure threshold, under the kill grace period
+      --app-load-timeout-ms N
+                         the longest anything waits for an app to load
+                         (default 60000, or $DASHBOARDS_APP_LOAD_TIMEOUT_MS)
 
   Command-line options override the config file, which overrides the
   environment variables.
+
+  The server listens at once and loads its apps in the background:
+  /_health answers 503 (\"starting\") until each has loaded, failed or
+  run out of time.
 
   On SIGTERM the server stops gracefully (see
   `dashboards.server/stop!`): /_health answers 503 while it drains,
@@ -69,6 +76,7 @@
           "--title" (recur rest (assoc opts :title (value)))
           "--max-sessions" (recur rest (assoc opts :max-sessions (number)))
           "--shutdown-delay-ms" (recur rest (assoc opts :shutdown-delay-ms (number)))
+          "--app-load-timeout-ms" (recur rest (assoc opts :app-load-timeout-ms (number)))
           "--no-reload" (recur more (assoc opts :reload? false))
           "--sanitize-errors" (recur more (assoc opts :sanitize-errors? true))
           ("-h" "--help") (recur more (assoc opts :help? true))
@@ -76,7 +84,8 @@
 
 (def ^:private env-numbers
   "Config keys read from the environment as numbers, and their variables."
-  {:port "PORT" :shutdown-delay-ms "DASHBOARDS_SHUTDOWN_DELAY_MS"})
+  {:port "PORT" :shutdown-delay-ms "DASHBOARDS_SHUTDOWN_DELAY_MS"
+   :app-load-timeout-ms "DASHBOARDS_APP_LOAD_TIMEOUT_MS"})
 
 (defn- env-config
   "Config from the environment (`getenv`, a function of a variable
@@ -90,6 +99,7 @@
       (env "DASHBOARDS_BASE_PATH") (assoc :base-path (env "DASHBOARDS_BASE_PATH"))
       (env "DASHBOARDS_APPS_DIR") (assoc :apps-dir (env "DASHBOARDS_APPS_DIR"))
       (env "DASHBOARDS_SHUTDOWN_DELAY_MS") (assoc :shutdown-delay-ms (env "DASHBOARDS_SHUTDOWN_DELAY_MS"))
+      (env "DASHBOARDS_APP_LOAD_TIMEOUT_MS") (assoc :app-load-timeout-ms (env "DASHBOARDS_APP_LOAD_TIMEOUT_MS"))
       (env "DASHBOARDS_CONFIG") (assoc :config-file (env "DASHBOARDS_CONFIG")))))
 
 (defn- read-config-file [path]

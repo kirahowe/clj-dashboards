@@ -409,6 +409,7 @@
           :port 9000 :reload? false}
          (main/config-from ["--app" "my.ns/app" "--app" "/b=./apps/b" "--port" "9000" "--no-reload"])))
   (is (= 10000 (:shutdown-delay-ms (main/config-from ["--app" "my.ns/app" "--shutdown-delay-ms" "10000"]))))
+  (is (= 5000 (:app-load-timeout-ms (main/config-from ["--app" "my.ns/app" "--app-load-timeout-ms" "5000"]))))
   (testing "numbers that aren't are refused, not ignored"
     (doseq [args [["--shutdown-delay-ms" "5s"] ["--shutdown-delay-ms" "-1"] ["--port" "http"]
                   ["--max-sessions" ""] ["--port"]]]
@@ -459,6 +460,131 @@
             (finally ((:close c))))))
       (finally (server/stop! s)))))
 
+(defn- wait-for
+  "Whether `pred` becomes true within `ms`, polling."
+  [pred ms]
+  (let [deadline (+ (System/currentTimeMillis) ms)]
+    (loop []
+      (cond (pred) true
+            (< (System/currentTimeMillis) deadline) (do (Thread/sleep 50) (recur))
+            :else false))))
+
+(defn- health []
+  (let [{:keys [status body]} (http-get "/_health")]
+    [status (json/read-json body)]))
+
+(defn- ms-since [t0] (/ (- (System/nanoTime) t0) 1e6))
+
+(defn- hung-source
+  "An app source whose loading never returns, until `release` is
+  delivered (then it fails)."
+  [release]
+  (reify apps/AppSource
+    (resolve-app [_] (deref release) (throw (ex-info "released" {})))
+    (source-dir [_] nil)))
+
+(deftest a-hung-app-doesnt-keep-the-server-from-listening
+  (let [release (promise)
+        t0 (System/nanoTime)
+        starting (future (server/start! {:port 0 :host "127.0.0.1" :app-load-timeout-ms 3000
+                                         :apps [{:path "/ok" :app counter-app}
+                                                {:path "/hang" :app (hung-source release)}]}))
+        s (deref starting 2000 nil)]
+    (try
+      (is (some? s) "start! returns at once")
+      (when s
+        (binding [*server* s]
+          (testing "while the hung app loads"
+            (let [[status body] (health)]
+              (is (= 503 status) "the server isn't ready yet...")
+              (is (= "starting" (get body "status")))
+              (is (= ["/hang"] (get body "loading"))))
+            (is (str/includes? (:body (http-get "/ok/")) "<title>Counter</title>")
+                "...but serves the other app")
+            (let [c (open-stream {"n" "4" "dsh" {"session" "" "kinds" {"n" "number"}}} "/ok")]
+              (try
+                (is (string? (session-of (await-event c connected?))))
+                (is (str/includes? (get-in (await-event c (output-for "sq")) [:data "elements"]) ">16<"))
+                (finally ((:close c)))))
+            (is (< (ms-since t0) 2500) "all before the hung app runs out of time"))
+          (testing "once it has run out of time"
+            (is (wait-for #(= 200 (first (health))) 6000) "the server is ready")
+            (is (>= (ms-since t0) 2900) "not before")
+            (is (= "ok" (get (second (health)) "status")))
+            (let [t1 (System/nanoTime)
+                  {:keys [status body]} (http-get "/hang/")]
+              (is (= 503 status) "the hung app reports that it hasn't loaded...")
+              (is (str/includes? body "has not finished loading"))
+              (is (< (ms-since t1) 1000) "...at once"))
+            (let [c (open-stream {"dsh" {"session" ""}} "/hang")]
+              (try
+                (await-event c (dashboards-event "failed") 2000)
+                (is (str/includes? (get-in (await-event c (dashboards-event "notify") 2000) [:data "message"])
+                                   "has not finished loading"))
+                (finally ((:close c)))))
+            (let [{:keys [status body]} (http-get "/")]
+              (is (= 200 status))
+              (is (str/includes? body "Not loaded yet")))
+            (is (str/includes? (:body (http-get "/ok/")) "<title>Counter</title>")))))
+      (finally
+        (deliver release true)
+        (some-> (or s (deref starting 5000 nil)) server/stop!)))))
+
+(deftest a-slow-app-is-waited-for
+  (let [calls (atom 0)
+        slow (reify apps/AppSource
+               (resolve-app [_]
+                 (when (= 1 (swap! calls inc)) (Thread/sleep 1500))
+                 counter-app)
+               (source-dir [_] nil))
+        t0 (System/nanoTime)
+        s (server/start! {:port 0 :host "127.0.0.1" :app-load-timeout-ms 30000
+                          :apps [{:path "/" :app counter-app} {:path "/slow-load" :app slow}]})]
+    (try
+      (binding [*server* s]
+        (is (= [503 "starting"] (let [[st b] (health)] [st (get b "status")])))
+        (is (= 200 (:status (http-get "/"))) "the other app is served")
+        (testing "a page for the app waits for its load"
+          (is (= 200 (:status (http-get "/slow-load/"))))
+          (is (= 1 @calls) "sharing it, rather than starting another"))
+        (is (wait-for #(= 200 (first (health))) 5000) "the server is ready once it has loaded...")
+        (is (< (ms-since t0) 5000) "...well before the timeout"))
+      (finally (server/stop! s)))))
+
+(deftest signals-reach-a-new-session-in-order
+  ;; A page posts a change just as its new session takes the signals
+  ;; held while its app loaded: the newer signals must win.
+  (let [srv *server*
+        newer {"n" "5" "dsh" {"kinds" {"n" "number"}}}
+        post-newer! (fn [s] (binding [*server* srv]
+                              (is (= 204 (post-signals (assoc-in newer ["dsh" "session"] (:id s)))))))
+        check (fn [what redefs]
+                (testing what
+                  (with-redefs-fn redefs
+                    (fn []
+                      (let [c (open-stream {"n" "3" "dsh" {"session" "" "kinds" {"n" "number"}}})]
+                        (try
+                          (let [sid (session-of (await-event c connected?))]
+                            (await-event c #(and ((output-for "sq") %)
+                                                 (str/includes? (get-in % [:data "elements"]) ">25<")))
+                            ;; Run on the session's thread, after any
+                            ;; signals queued before it.
+                            (is (= "n\n5\n" (:body (http-get (str "/_dashboards/download/" sid "/csv"))))
+                                "the session ends up with the newer signals"))
+                          (finally ((:close c)))))))))]
+    (let [resend! session/resend-outputs!
+          once (atom true)]
+      (check "a post just before the held signals are applied"
+             {#'session/resend-outputs! (fn [s]
+                                          (when (compare-and-set! once true false) (post-newer! s))
+                                          (resend! s))}))
+    (let [receive! session/receive!
+          once (atom true)]
+      (check "a post while the held signals are applied"
+             {#'session/receive! (fn [s signals]
+                                   (when (compare-and-set! once true false) (post-newer! s))
+                                   (receive! s signals))}))))
+
 (deftest apps-load-as-the-server-starts
   (let [root (temp-dir)
         resolved (atom 0)
@@ -472,9 +598,10 @@
                                  {:path "/broken" :app broken-app}]})]
     (try
       (binding [*server* s]
-        (is (pos? @resolved) "configured apps are resolved before any request")
+        (is (wait-for #(= 200 (:status (http-get "/_health"))) 10000)
+            "the server is ready once they have loaded, a broken one too")
+        (is (pos? @resolved) "configured apps are resolved before any request for them")
         (is (= (inc before) @loads) "as are those in the apps directory")
-        (is (= 200 (:status (http-get "/_health"))) "and a broken one doesn't stop the server")
         (is (str/includes? (:body (http-get "/found/")) "Slow to load"))
         (is (= (inc before) @loads) "which doesn't load them again"))
       (finally (server/stop! s)))))
@@ -569,5 +696,7 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"^\$PORT expects a whole number"
                           (main/config-from ["--app" "my.ns/app"] (env {"PORT" "http"})))
         "a bad variable that is used is refused")
+    (is (= 9000 (:app-load-timeout-ms (main/config-from ["--app" "my.ns/app"]
+                                                        (env {"DASHBOARDS_APP_LOAD_TIMEOUT_MS" "9000"})))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"^\$DASHBOARDS_SHUTDOWN_DELAY_MS expects"
                           (main/config-from ["--app" "my.ns/app"] (env {"DASHBOARDS_SHUTDOWN_DELAY_MS" "-5"}))))))
