@@ -412,10 +412,18 @@
   (is (= 5000 (:app-load-timeout-ms (main/config-from ["--app" "my.ns/app" "--app-load-timeout-ms" "5000"]))))
   (testing "numbers that aren't are refused, not ignored"
     (doseq [args [["--shutdown-delay-ms" "5s"] ["--shutdown-delay-ms" "-1"] ["--port" "http"]
-                  ["--max-sessions" ""] ["--port"]]]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"^--\S+ (expects a whole number|needs a value)"
+                  ["--max-sessions" ""] ["--port"]
+                  ["--app-load-timeout-ms" "0"] ["--app-load-timeout-ms" "-5"]]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"^--\S+ (expects a (positive )?whole number|needs a value)"
                             (main/config-from (into ["--app" "my.ns/app"] args)))
-          (pr-str args)))))
+          (pr-str args))))
+  (testing "a timeout of 0 is refused before the server starts"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"^\$DASHBOARDS_APP_LOAD_TIMEOUT_MS expects a positive whole number"
+                          (main/config-from ["--app" "my.ns/app"] {"DASHBOARDS_APP_LOAD_TIMEOUT_MS" "0"})))
+    (let [f (io/file (.toFile (Files/createTempDirectory "dashboards" (make-array FileAttribute 0))) "server.edn")]
+      (spit f "{:app-load-timeout-ms 0}")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #":app-load-timeout-ms .* should be a positive number"
+                            (main/config-from ["--app" "my.ns/app" "--config" (str f)]))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Loading apps, and races between streams and sessions
@@ -513,12 +521,14 @@
             (is (= "ok" (get (second (health)) "status")))
             (let [t1 (System/nanoTime)
                   {:keys [status body]} (http-get "/hang/")]
+              ;; Its load was interrupted and dropped, so this tries
+              ;; again -- and it hangs again.
               (is (= 503 status) "the hung app reports that it hasn't loaded...")
               (is (str/includes? body "has not finished loading"))
-              (is (< (ms-since t1) 1000) "...at once"))
+              (is (< (ms-since t1) 4500) "...within the timeout"))
             (let [c (open-stream {"dsh" {"session" ""}} "/hang")]
               (try
-                (await-event c (dashboards-event "failed") 2000)
+                (await-event c (dashboards-event "failed") 5000)
                 (is (str/includes? (get-in (await-event c (dashboards-event "notify") 2000) [:data "message"])
                                    "has not finished loading"))
                 (finally ((:close c)))))
@@ -700,3 +710,137 @@
                                                         (env {"DASHBOARDS_APP_LOAD_TIMEOUT_MS" "9000"})))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"^\$DASHBOARDS_SHUTDOWN_DELAY_MS expects"
                           (main/config-from ["--app" "my.ns/app"] (env {"DASHBOARDS_SHUTDOWN_DELAY_MS" "-5"}))))))
+
+;; ---------------------------------------------------------------------------
+;; Loading apps one at a time
+
+(def ^:private heavy-libs
+  "Libraries on the test classpath that no test namespace loads, so the
+  apps below are the first to require them."
+  '[clojure.core.async clojure.test.check.generators tech.v3.dataset.reductions fastmath.signal])
+
+(deftest apps-that-require-the-same-new-libraries-all-load
+  ;; Clojure's `require` isn't thread-safe: apps loading side by side,
+  ;; each requiring libraries not loaded yet, broke one another (and
+  ;; stayed broken), so apps load one at a time.
+  (is (not-any? find-ns heavy-libs) "the libraries aren't loaded yet")
+  (let [root (temp-dir)
+        names (mapv #(str "heavy" %) (range 1 7))]
+    (doseq [n names]
+      (.mkdirs (io/file root n))
+      (spit (io/file root n "app.clj")
+            (str "(ns " n ".app (:require [dashboards.app :as app] [dashboards.ui :as ui]"
+                 " [dashboards.render :as render]"
+                 " [clojure.core.async :as a] [clojure.test.check.generators :as gen]"
+                 " [tech.v3.dataset.reductions :as reds] [fastmath.signal :as sig]))\n"
+                 "(def sample (gen/sample gen/small-integer 3))\n"
+                 "(def red reds/sum)\n"
+                 "(app/app {:title \"" n "\" :ui (ui/page (ui/text-output :out))"
+                 " :server (fn [_] {:out (render/text (str \"ok \" (a/<!! (a/go 42))))})})\n")))
+    (let [s (server/start! {:port 0 :host "127.0.0.1" :apps-dir (str root) :app-load-timeout-ms 120000})]
+      (try
+        (binding [*server* s]
+          (is (wait-for #(= 200 (first (health))) 120000) "the server is ready once they have loaded")
+          (doseq [n names]
+            (let [{:keys [status body]} (http-get (str "/" n "/"))]
+              (is (= 200 status) n)
+              (is (str/includes? body (str "<title>" n "</title>")) n)))
+          (let [c (open-stream {"dsh" {"session" ""}} (str "/" (peek names)))]
+            (try
+              (is (str/includes? (get-in (await-event c (output-for "out") 20000) [:data "elements"]) "ok 42")
+                  "and run")
+              (finally ((:close c))))))
+        (finally (server/stop! s))))))
+
+(def hang-events
+  "What the hanging test apps below report: :entered as one starts to
+  hang, :interrupted as one is interrupted."
+  (LinkedBlockingQueue.))
+
+(defn- write-titled-app!
+  "Write an app directory `dir` titled `title`, its app.clj running
+  `body` (a string of code) first."
+  [dir ns-name title body]
+  (.mkdirs (io/file dir))
+  (spit (io/file dir "app.clj")
+        (str "(ns " ns-name " (:require [dashboards.app :as app] [dashboards.ui :as ui]))\n"
+             body "\n"
+             "(app/app {:title \"" title "\" :ui (ui/page [:p \"hi\"])})\n")))
+
+(defn- await-hang-event [ms]
+  (.poll ^LinkedBlockingQueue hang-events ms TimeUnit/MILLISECONDS))
+
+(deftest a-hung-app-is-interrupted-and-the-next-one-loads
+  (.clear ^LinkedBlockingQueue hang-events)
+  (let [root (temp-dir)
+        hang (io/file root "hang")
+        _ (write-titled-app! hang "hang.app" "Hang"
+                             (str "(.put dashboards.server-test/hang-events :entered)\n"
+                                  "(try (Thread/sleep Long/MAX_VALUE)"
+                                  " (catch InterruptedException e"
+                                  " (.put dashboards.server-test/hang-events :interrupted) (throw e)))"))
+        s (server/start! {:port 0 :host "127.0.0.1" :apps-dir (str root) :app-load-timeout-ms 3000})]
+    (try
+      (binding [*server* s]
+        (is (= :entered (await-hang-event 10000)) "the hung app is loading")
+        (let [t0 (System/nanoTime)]
+          (testing "an app loading after a hung one"
+            (write-titled-app! (io/file root "later") "later.app" "Later" "")
+            (is (wait-for #(= 200 (:status (http-get "/later/"))) 8000)
+                "loads once the hung one is interrupted...")
+            (is (> (ms-since t0) 2000) "...and not before")
+            (is (= :interrupted (await-hang-event 1000)))
+            (is (str/includes? (:body (http-get "/later/")) "<title>Later</title>")))
+          (testing "the hung app reports it"
+            (is (wait-for #(= 200 (first (health))) 2000))
+            (let [{:keys [status body]} (http-get "/hang/")]
+              (is (= 503 status))
+              (is (str/includes? body "has not finished loading")))))
+        (testing "a hung app whose file is fixed loads"
+          ;; The request above tried it again, and it hung again.
+          (is (= :entered (await-hang-event 1000)))
+          (is (= :interrupted (await-hang-event 5000)))
+          (Thread/sleep 1100) ; file mtimes can be second-granular
+          (write-titled-app! hang "hang.app" "Fixed" "")
+          (let [{:keys [status body]} (http-get "/hang/")]
+            (is (= 200 status))
+            (is (str/includes? body "<title>Fixed</title>")))
+          (is (str/includes? (:body (http-get "/later/")) "<title>Later</title>"))))
+      (finally (server/stop! s)))))
+
+(def stubborn-release "Lets the stubborn test app finish loading." (atom false))
+
+(deftest an-app-that-ignores-interruption
+  (reset! stubborn-release false)
+  (.clear ^LinkedBlockingQueue hang-events)
+  (let [root (temp-dir)
+        _ (write-titled-app! (io/file root "stubborn") "stubborn.app" "Stubborn"
+                             (str "(.put dashboards.server-test/hang-events :entered)\n"
+                                  "(while (not @dashboards.server-test/stubborn-release)"
+                                  " (try (Thread/sleep 50) (catch InterruptedException _"
+                                  " (.put dashboards.server-test/hang-events :interrupted))))"))
+        s (server/start! {:port 0 :host "127.0.0.1" :apps-dir (str root) :app-load-timeout-ms 1500})]
+    (try
+      (binding [*server* s]
+        (is (= :entered (await-hang-event 10000)))
+        (write-titled-app! (io/file root "queued") "queued.app" "Queued" "")
+        (testing "keeps the apps after it waiting, but every request is answered within the timeout"
+          (let [t0 (System/nanoTime)
+                {:keys [status body]} (http-get "/queued/")]
+            (is (= 503 status))
+            (is (str/includes? body "waiting for an earlier load to finish"))
+            (is (< (ms-since t0) 2500)))
+          (is (= :interrupted (await-hang-event 2000)) "it was interrupted, and carried on")
+          (let [t0 (System/nanoTime)
+                {:keys [status body]} (http-get "/stubborn/")]
+            (is (= 503 status))
+            (is (str/includes? body "has not finished loading"))
+            (is (< (ms-since t0) 2500))))
+        (testing "once it finishes, they load"
+          (reset! stubborn-release true)
+          (is (wait-for #(= 200 (:status (http-get "/queued/"))) 5000))
+          (is (str/includes? (:body (http-get "/stubborn/")) "<title>Stubborn</title>")
+              "and it too, having loaded meanwhile")))
+      (finally
+        (reset! stubborn-release true)
+        (server/stop! s)))))

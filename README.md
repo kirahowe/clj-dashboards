@@ -346,15 +346,17 @@ causes a reconnect: the browser reopens the stream and carries on in
 the same session.
 
 **Startup.** The server listens at once and loads its apps in the
-background, each on its own thread, logging how long each took.
-Until every app has loaded, failed, or run out of time
-(`:app-load-timeout-ms`, default 60000, or `--app-load-timeout-ms`),
-`/_health` answers 503 with `{"status": "starting", "loading": [...]}`,
-so readiness checks hold traffic back until the apps are warm. A
-request for an app still loading waits for it, up to that timeout;
-an app that fails or runs out of time is logged and reports its error
-when opened, while the others are served as usual. So an `app.clj` that
-hangs (on a database connection, say) only takes down itself. Give the
+background, one at a time (Clojure's `require` isn't thread-safe),
+logging how long each took. Until every app has loaded, failed, or run
+out of time (`:app-load-timeout-ms`, default 60000, or
+`--app-load-timeout-ms`), `/_health` answers 503 with
+`{"status": "starting", "loading": [...]}`, so readiness checks hold
+traffic back until the apps are warm. A request for an app still
+loading waits for it, up to that timeout; an app that fails or runs out
+of time is logged and reports its error when opened, while the others
+are served as usual. An `app.clj` that hangs (on a database connection,
+say) delays the apps loaded after it until the timeout interrupts it,
+then fails on its own; it loads again when next requested. Give the
 timeout room for apps whose `deps.edn` fetches libraries on first start.
 
 **Deploys and shutdown.** When the server is stopped (SIGTERM, or

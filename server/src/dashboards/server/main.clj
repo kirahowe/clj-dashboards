@@ -30,9 +30,10 @@
   Command-line options override the config file, which overrides the
   environment variables.
 
-  The server listens at once and loads its apps in the background:
-  /_health answers 503 (\"starting\") until each has loaded, failed or
-  run out of time.
+  The server listens at once and loads its apps in the background, one
+  at a time: /_health answers 503 (\"starting\") until each has loaded,
+  failed or run out of time. A hung app.clj delays the apps loaded
+  after it until the timeout interrupts it.
 
   On SIGTERM the server stops gracefully (see
   `dashboards.server/stop!`): /_health answers 503 while it drains,
@@ -59,6 +60,14 @@
       (throw (ex-info (str what " expects a whole number, not " (pr-str s)) {:option what :value s})))
     n))
 
+(defn- positive-number
+  "`s` as a positive whole number, as for `whole-number`."
+  [what s]
+  (let [n (some-> s str/trim parse-long)]
+    (when-not (and n (pos? n))
+      (throw (ex-info (str what " expects a positive whole number, not " (pr-str s)) {:option what :value s})))
+    n))
+
 (defn parse-args [args]
   (loop [[a & more :as args] args, opts {}]
     (if (empty? args)
@@ -76,16 +85,18 @@
           "--title" (recur rest (assoc opts :title (value)))
           "--max-sessions" (recur rest (assoc opts :max-sessions (number)))
           "--shutdown-delay-ms" (recur rest (assoc opts :shutdown-delay-ms (number)))
-          "--app-load-timeout-ms" (recur rest (assoc opts :app-load-timeout-ms (number)))
+          "--app-load-timeout-ms" (recur rest (assoc opts :app-load-timeout-ms (positive-number a (value))))
           "--no-reload" (recur more (assoc opts :reload? false))
           "--sanitize-errors" (recur more (assoc opts :sanitize-errors? true))
           ("-h" "--help") (recur more (assoc opts :help? true))
           (throw (ex-info (str "Unknown option: " a) {:arg a})))))))
 
 (def ^:private env-numbers
-  "Config keys read from the environment as numbers, and their variables."
-  {:port "PORT" :shutdown-delay-ms "DASHBOARDS_SHUTDOWN_DELAY_MS"
-   :app-load-timeout-ms "DASHBOARDS_APP_LOAD_TIMEOUT_MS"})
+  "Config keys read from the environment as numbers, their variables,
+  and how to parse them."
+  {:port ["PORT" whole-number]
+   :shutdown-delay-ms ["DASHBOARDS_SHUTDOWN_DELAY_MS" whole-number]
+   :app-load-timeout-ms ["DASHBOARDS_APP_LOAD_TIMEOUT_MS" positive-number]})
 
 (defn- env-config
   "Config from the environment (`getenv`, a function of a variable
@@ -118,11 +129,17 @@
          from-file (when file (read-config-file file))
          merged (merge env from-file (dissoc cli :config-file))
          ;; Numbers from the environment that nothing overrides.
-         merged (reduce-kv (fn [m k var]
+         merged (reduce-kv (fn [m k [var parse]]
                              (if (and (contains? env k) (identical? (get env k) (get m k)))
-                               (assoc m k (whole-number (str "$" var) (get env k)))
+                               (assoc m k (parse (str "$" var) (get env k)))
                                m))
-                           merged env-numbers)]
+                           merged env-numbers)
+         timeout (:app-load-timeout-ms merged)]
+     ;; From the config file, so possibly anything.
+     (when-not (or (nil? timeout) (and (number? timeout) (pos? timeout)))
+       (throw (ex-info (str ":app-load-timeout-ms in " file " should be a positive number of milliseconds, not "
+                            (pr-str timeout))
+                       {:app-load-timeout-ms timeout})))
      (cond-> (dissoc merged :config-file :help?)
        (and (:apps from-file) (:apps cli)) (assoc :apps (into (vec (:apps from-file)) (:apps cli)))
        (:help? cli) (assoc :help? true)))))
