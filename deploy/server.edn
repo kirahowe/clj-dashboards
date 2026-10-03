@@ -17,4 +17,12 @@
  :max-sessions 200
 
  ;; End a session after this long without a heartbeat from its page.
- :session-timeout-ms 120000}
+ :session-timeout-ms 120000
+
+ ;; On shutdown, report unhealthy on /_health for this long before
+ ;; closing the event streams, so a load balancer stops sending new
+ ;; tabs here first. Keep it under the platform's stop grace period
+ ;; (10s for docker stop and Cloud Run, 30s by default in Kubernetes).
+ ;; Leave it at 0 (the default) with a single instance.
+ ;; :shutdown-delay-ms 5000
+ }

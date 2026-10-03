@@ -25,4 +25,8 @@ The container listens on port 8080. Point health checks at `/_health`.
 The browser talks to the app over plain HTTP: one long-lived
 server-sent event stream per tab, plus small POSTs. Any proxy that
 streams responses works; turn off response buffering for
-`_dashboards/stream` if yours buffers.
+`_dashboards/stream` if yours buffers. Serve it to browsers over
+HTTP/2, since each open tab holds a connection, and use sticky sessions
+if you run more than one instance. See
+[Running it in production](https://github.com/kirahowe/clj-dashboards#running-it-in-production)
+for proxy, shutdown and platform details.

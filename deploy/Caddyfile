@@ -1,5 +1,20 @@
-# Caddy streams server-sent events (the sessions' event streams) with no
-# extra configuration.
+# Caddy gets a certificate for the domain and serves HTTP/2 and HTTP/3
+# by default, which matters here: over HTTP/1.1 browsers open at most
+# six connections to a host, and every open dashboard tab keeps one
+# busy with its event stream. Caddy also flushes server-sent event
+# streams as they arrive, so they need no extra configuration.
 dashboards.example.com {
 	reverse_proxy dashboards:8080
 }
+
+# With more than one replica, keep each browser on one of them (a tab's
+# session lives in one server's memory), and stop sending new tabs to
+# one that is shutting down:
+#
+# dashboards.example.com {
+# 	reverse_proxy dashboards-1:8080 dashboards-2:8080 {
+# 		lb_policy cookie
+# 		health_uri /_health
+# 		health_interval 5s
+# 	}
+# }
