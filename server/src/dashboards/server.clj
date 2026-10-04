@@ -14,11 +14,14 @@
   beacon on the way out.
 
   The server listens as soon as it starts, and loads its apps in the
-  background, one at a time (Clojure's `require` isn't thread-safe):
-  `/_health` answers 503 (`starting`) until every app has loaded,
-  failed, or taken longer than `:app-load-timeout-ms`. Nothing waits
-  longer than that for an app; one whose `app.clj` hangs is interrupted
-  then and fails, and delays only the apps loading after it.
+  background, one at a time through its own queue (Clojure's `require`
+  isn't thread-safe): `/_health` answers 503 (`starting`) until every
+  app has loaded, failed, or taken longer than `:app-load-timeout-ms`.
+  Nothing waits longer than that for an app. One whose `app.clj` hangs
+  fails then, is interrupted, and stops holding up the apps queued
+  behind it; if it ignores the interrupt, its thread is abandoned
+  (restart the server to reclaim it). An app that failed to load
+  answers 503 at once, without loading again, until its files change.
 
   Stopping the server (`stop!`, which the standalone server runs on
   SIGTERM) drains it first: `/_health` answers 503 and new streams are
@@ -55,7 +58,9 @@
            (java.net URLDecoder URLEncoder)
            (java.util UUID)
            (java.util.concurrent ExecutorService Executors Future RejectedExecutionException
-                                 ScheduledExecutorService ScheduledThreadPoolExecutor ThreadFactory TimeUnit)
+                                 ScheduledExecutorService ScheduledThreadPoolExecutor Semaphore ThreadFactory
+                                 TimeUnit)
+           (java.util.concurrent.atomic AtomicBoolean)
            (java.time LocalDateTime)
            (java.time.format DateTimeFormatter)))
 
@@ -212,11 +217,26 @@
 ;; a hung app ties up one thread, not one per request.
 ;;
 ;; As Clojure's `require` isn't thread-safe, apps load one at a time,
-;; under its require lock (see `apps/serialized`). A load is timed from
-;; when it holds the lock: one still running `:app-load-timeout-ms`
-;; after that is interrupted, so that the apps waiting behind it can
-;; load, and fails. Its entry is dropped then, so a later request (say,
-;; once its file is fixed) loads the app again.
+;; each waiting its turn for the server's one load permit,
+;; `:load-permit` (see `serializer`). Nothing but loads takes it:
+;; requests for apps already loaded, and code requiring a namespace (in
+;; a session, or in a future an `app.clj` waits for), never wait for
+;; it. A load is timed from when it gets the permit. One still running
+;; `:app-load-timeout-ms` later fails, has its permit released for it
+;; -- so the next load starts, whatever this one does -- and is
+;; interrupted. If it ignores the interrupt (blocked reading a socket
+;; that never answers, say), its thread carries on, abandoned, until it
+;; returns or the server restarts; should it return an app after all,
+;; that app is served. Meanwhile it may still be loading code as later
+;; loads run, and the two could then race as Clojure's `require`
+;; isn't thread-safe: a risk taken so that one stuck `app.clj` can't
+;; keep every app after it from loading.
+;;
+;; An app that failed to load, or ran out of time, stays failed (see
+;; `current-failure`): requests for it get its failure at once, and the
+;; index page reports it, without loading it again -- until its files
+;; change (`apps/source-fingerprint`). Then the next request loads it
+;; once more.
 
 (defn- submit! [server-state f]
   (.execute ^ExecutorService (:executor server-state) ^Runnable f))
@@ -238,33 +258,79 @@
   (deliver (:result l) r)
   (swap! (:loads server-state) #(if (identical? l (get % path)) (dissoc % path) %)))
 
+(defn- failure-reason
+  "Why an app failed to load, `t` being what it threw."
+  [^Throwable t]
+  (let [compiler? (instance? clojure.lang.Compiler$CompilerException t)
+        ;; Such an exception's own message only says where.
+        ^Throwable c (or (when compiler? (ex-cause t)) t)
+        {:clojure.error/keys [source line]} (when compiler? (ex-data t))]
+    (str (or (ex-message c) (.getName (class c)))
+         (when (and source (not= c t))
+           (str " (" (.getName (io/file (str source))) (when line (str ":" line)) ")")))))
+
+(defn- fail!
+  "Load `l` of `mount`'s app has failed, because of `cause`: make that
+  its result, and remember it, so that the app reports it at once,
+  without loading again, until its files change (see
+  `current-failure`). Returns the error the app reports."
+  [server-state {:keys [path source]} l ^Throwable cause]
+  (let [e (ex-info (str "The app at " path " failed to load: " (failure-reason cause) "; "
+                        (apps/retry-hint source) ".")
+                   {::not-loaded path ::failed path} cause)]
+    (when-not (closing? server-state)
+      (swap! (:failures server-state) assoc path
+             {:fp (or @(:fp l) (apps/source-fingerprint source)) :error e :load l}))
+    (finish! server-state path l {:error e})
+    e))
+
+(defn- current-failure
+  "How `mount`'s app failed to load, if it did and its files haven't
+  changed since: `{:error e ...}`."
+  [server-state {:keys [path source]}]
+  (when-let [f (get @(:failures server-state) path)]
+    (when (= (:fp f) (apps/source-fingerprint source))
+      f)))
+
+(defn- release-permit!
+  "Release the load permit load `l` holds, if it holds it still. Exactly
+  once: the load releases it as it finishes, unless `time-out!` has
+  released it for the load first."
+  [server-state l]
+  (when (.compareAndSet ^AtomicBoolean (:permit l) true false)
+    (.release ^Semaphore (:load-permit server-state))
+    (progress! server-state)))
+
 (defn- time-out!
-  "Load `l` has run out of time, unless its clock has been reset since
-  `clock` was set: interrupt it, and fail it."
-  [server-state path l clock]
+  "Load `l` has run out of time, unless its clock has been stopped or
+  reset since `clock` was set: fail it, release its permit so that the
+  next load can start, and interrupt it."
+  [server-state {:keys [path source] :as mount} l clock]
   (let [timeout (:app-load-timeout-ms (:config server-state))
+        ^Thread thread @(:thread l)
         ;; Under `l`'s lock, so as not to interrupt its thread once it
         ;; has moved on to other work (see `run-load!`).
-        interrupted? (locking l
-                       (when (and (identical? clock @(:clock l)) (not @(:done l)))
-                         (when-not (closing? server-state)
-                           (log "the app at" path "took longer than" (str timeout "ms") "to load; interrupting it"
-                                "(it reports this when opened, and loads again when next requested)"))
-                         ;; Before interrupting it, so that this, not the
-                         ;; error the interrupt causes, is its result.
-                         (finish! server-state path l
-                                  {:error (ex-info (str "The app at " path " has not finished loading after "
-                                                        timeout "ms, so its load was stopped; see the server log.")
-                                                   {::not-loaded path})})
-                         (.interrupt ^Thread @(:thread l))
-                         true))]
-    (when interrupted?
+        timed-out? (locking l
+                     (when (and (identical? clock @(:clock l)) (not @(:done l)))
+                       (when-not (closing? server-state)
+                         (log "the app at" path "took longer than" (str timeout "ms") "to load; interrupting it."
+                              "It reports this when opened;" (apps/retry-hint source)))
+                       ;; Before interrupting it, so that this, not the
+                       ;; error the interrupt causes, is its result.
+                       (fail! server-state mount l
+                              (ex-info (str "it took longer than " timeout "ms, so its load was stopped")
+                                       {::timed-out true}))
+                       (release-permit! server-state l)
+                       (.interrupt thread)
+                       true))]
+    (when timed-out?
       (progress! server-state)
       (when-not (closing? server-state)
         (schedule! server-state (min 1000 timeout)
                    #(when-not (or @(:done l) (closing? server-state))
-                      (log "app" path "is still loading after timeout and ignored interruption;"
-                           "later app loads will wait")))))))
+                      (log "the app at" path "ignored its interruption and is still loading, on thread"
+                           (str (.getName thread) ".") "It is abandoned: it no longer holds up other loads,"
+                           "and if it finishes, its app is served. Restart the server to reclaim the thread")))))))
 
 (defn- stop-clock!
   "Stop timing load `l`."
@@ -273,58 +339,113 @@
 
 (defn- start-clock!
   "Time load `l` from now."
-  [server-state path l]
+  [server-state mount l]
   (stop-clock! l)
   (let [clock {:at (now)}]
     (reset! (:clock l) clock)
     (reset! (:timer l) (schedule! server-state (:app-load-timeout-ms (:config server-state))
-                                  #(time-out! server-state path l clock)))))
+                                  #(time-out! server-state mount l clock)))))
+
+(defn- serializer
+  "Load `l`'s `apps/*serializer*`: it runs a load once it has the
+  server's load permit, and times it from then (see `time-out!`).
+
+  The permit is the server's own (each server has one): nothing but its
+  app loads waits for it, unlike Clojure's require lock. A load that
+  runs out of time has it released on its behalf, exactly once (see
+  `release-permit!`), whether or not its thread ever returns. Residual
+  risk: a thread abandoned that way while it is still requiring
+  namespaces can race the next load, as Clojure's `require` isn't
+  thread-safe; that is preferred to one stuck `app.clj` blocking every
+  load after it for good."
+  [server-state {:keys [source] :as mount} l]
+  (fn [f]
+    ;; Not timed while it waits its turn.
+    (locking l (reset! (:clock l) nil))
+    (stop-clock! l)
+    (.acquire ^Semaphore (:load-permit server-state))
+    (.set ^AtomicBoolean (:permit l) true)
+    (try
+      ;; As the files are now, before it reads them: should they
+      ;; change while it loads, it is loaded again.
+      (reset! (:fp l) (apps/source-fingerprint source))
+      (progress! server-state)
+      (start-clock! server-state mount l)
+      (f)
+      (finally
+        ;; Stopped, under its lock, before the permit goes, so that it
+        ;; can't run out of time once done with it.
+        (locking l (swap! (:clock l) #(some-> % (assoc :stopped (now)))))
+        (stop-clock! l)
+        (release-permit! server-state l)))))
 
 (defn- run-load!
   "Load `mount`'s app, as load `l` (see `load!`), on this thread."
-  [server-state {:keys [path source]} l]
+  [server-state {:keys [path source] :as mount} l]
   (reset! (:thread l) (Thread/currentThread))
-  ;; An app source that doesn't take the lock is timed from now.
-  (start-clock! server-state path l)
-  (let [r (try
-            (binding [apps/*on-load-phase* (fn [phase]
-                                             (case phase
-                                               ;; Not timed while it waits its turn.
-                                               :waiting (do (stop-clock! l)
-                                                            (reset! (:clock l) nil))
-                                               :loading (do (progress! server-state)
-                                                            (start-clock! server-state path l))))]
+  ;; An app source that doesn't wait its turn is timed from now.
+  (start-clock! server-state mount l)
+  (let [t0 (now)
+        r (try
+            (binding [apps/*serializer* (serializer server-state mount l)]
               {:app (apps/resolve-app source)})
-            (catch Throwable t {:error t}))]
-    (locking l (reset! (:done l) true))
+            (catch Throwable t {:error t}))
+        ;; Whether it ran out of time, and has failed already.
+        late? (locking l
+                (reset! (:done l) true)
+                (realized? (:result l)))]
     (stop-clock! l)
     ;; Clear an interrupt meant for this load, now done.
     (Thread/interrupted)
     (progress! server-state)
-    (finish! server-state path l r)
-    (let [timeout (:app-load-timeout-ms (:config server-state))
-          ms (some->> @(:clock l) :at (- (now)))]
-      (when (and ms (> ms timeout) (not (closing? server-state)))
-        ;; Past its timeout (see `time-out!`).
+    (cond
+      (:app r)
+      (do
+        ;; Served from now on, even if it ran out of time first -- unless
+        ;; another load has failed since.
+        (swap! (:failures server-state)
+               (fn [m] (if (or (not late?) (identical? l (:load (get m path)))) (dissoc m path) m)))
+        (finish! server-state path l r))
+
+      late? nil
+
+      :else
+      (do
+        (fail! server-state mount l (:error r))
+        (when-not (closing? server-state)
+          (log "the app at" path "failed to load after" (str (- (now) t0) "ms -") (failure-reason (:error r))
+               (str "(it reports this when opened; " (apps/retry-hint source) ")")))))
+    (when (and late? (not (closing? server-state)))
+      (let [ms (some->> @(:clock l) :at (- (now)))]
         (log "the app at" path
-             (cond (:app r) (str "finished loading after " ms "ms")
-                   (::not-loaded (ex-data (:error @(:result l))))
-                   (str "stopped loading after " ms "ms, as interrupted")
-                   :else (str "failed to load after " ms "ms - " (ex-message (:error r)))))))))
+             (if (:app r)
+               (str "finished loading after " ms "ms, past its timeout; serving it")
+               (str "stopped loading after " ms "ms - " (failure-reason (:error r)))))))))
 
 (defn- load!
   "The load of `mount`'s app in progress, starting one if there is none:
   `{:result <promise of {:app a} or {:error e}> :requested <ms>
-  :clock <atom of {:at <ms>} while it is timed, else nil> ...}`."
+  :clock <atom of {:at <ms>} while it is timed, else nil> ...}`. An app
+  that failed to load, its files unchanged since, isn't loaded again:
+  its load fails at once."
   [server-state {:keys [path] :as mount}]
   (let [loads (:loads server-state)
         mine {:result (promise) :requested (now)
-              :clock (atom nil) :timer (atom nil) :thread (atom nil) :done (atom false)}
+              :clock (atom nil) :timer (atom nil) :thread (atom nil) :done (atom false)
+              ;; Whether it holds the load permit (see `release-permit!`).
+              :permit (AtomicBoolean. false)
+              ;; Its source's fingerprint as it began loading.
+              :fp (atom nil)}
         current (get (swap! loads #(if (contains? % path) % (assoc % path mine))) path)]
     (when (identical? current mine)
-      (try
-        (submit! server-state #(run-load! server-state mount mine))
-        (catch Throwable t (finish! server-state path mine {:error t}))))
+      ;; Checked once this is the app's only load, as a failure is
+      ;; remembered before its load is forgotten: so a change to its
+      ;; files has it loaded again just once.
+      (if-let [{:keys [error]} (current-failure server-state mount)]
+        (finish! server-state path mine {:error error})
+        (try
+          (submit! server-state #(run-load! server-state mount mine))
+          (catch Throwable t (finish! server-state path mine {:error t})))))
     current))
 
 (defn- await-load
@@ -570,9 +691,10 @@
 (defn- index-page [server-state mounts]
   (let [{:keys [title]} (:config server-state)
         title (or title "Dashboards")
-        ;; Every app's load is started (they run one at a time); then
-        ;; the page waits a moment at most, rather than for an app still
-        ;; loading.
+        ;; Every app's load is started (they run one at a time), but
+        ;; for those that failed and haven't changed since (see
+        ;; `load!`); then the page waits a moment at most, rather than
+        ;; for an app still loading.
         loads (mapv (fn [m] [m (load! server-state m)]) (sort-by :path mounts))
         deadline (+ (now) 1000)]
     (html-response
@@ -665,12 +787,17 @@
                 (text 404 "Not found"))
               :else (text 404 "Not found")))))
       (catch Throwable t
-        (log "error handling" (:uri req) "-" (ex-message t))
-        (if (::not-loaded (ex-data t))
-          (text 503 (ex-message t))
-          (text 500 (if (:sanitize-errors? (:config server-state))
-                      "Internal server error"
-                      (str "Error: " (ex-message t)))))))))
+        (let [{::keys [not-loaded failed]} (ex-data t)
+              sanitize? (:sanitize-errors? (:config server-state))]
+          ;; An app's failure to load was logged as it failed.
+          (when-not failed
+            (log "error handling" (:uri req) "-" (ex-message t)))
+          (cond
+            (and failed sanitize?) (text 503 (str "The app at " failed " failed to load; see the server log."))
+            not-loaded (text 503 (ex-message t))
+            :else (text 500 (if sanitize?
+                              "Internal server error"
+                              (str "Error: " (ex-message t))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Starting and stopping
@@ -682,17 +809,19 @@
 (defn- load-apps!
   "Start loading every app mounted now, so that the first visitors don't
   wait for them; they load one at a time (see `load!`). `/_health`
-  reports `starting` until each has loaded, failed or run out of time,
-  or has waited `:app-load-timeout-ms` for its turn without any load
-  starting or ending meanwhile (when one ignored its interruption,
-  say). One that failed or ran out is logged, and reports it when
-  opened, as a broken app mustn't take the others down."
+  reports `starting` until each has loaded, failed or run out of time
+  -- or, should the queue somehow stall, has waited a second more than
+  `:app-load-timeout-ms` for its turn without any load starting or
+  ending meanwhile. One that failed or ran out is logged, and reports
+  it when opened, as a broken app mustn't take the others down."
   [server-state]
   (let [mounts (sort-by :path (current-mounts server-state))
         starting (:starting server-state)
         timeout (:app-load-timeout-ms (:config server-state))
+        ;; Each load ahead of it ends within `timeout`: the time-out
+        ;; that ends one is given a moment more, to fire.
         stalled? (fn [l] (and (nil? @(:clock l))
-                              (> (- (now) @(:load-progress server-state)) timeout)))
+                              (> (- (now) @(:load-progress server-state)) (+ timeout 1000))))
         t0 (now)]
     (when (seq mounts)
       (reset! starting (set (map :path mounts)))
@@ -704,11 +833,14 @@
                  (fn []
                    (try
                      (let [l (load! server-state mount)
-                           r (loop []
-                               (if-some [r (deref (:result l) 100 nil)]
-                                 r
-                                 (when-not (or (closing? server-state) (stalled? l))
-                                   (recur))))
+                           r (try
+                               (loop []
+                                 (if-some [r (deref (:result l) 100 nil)]
+                                   r
+                                   (when-not (or (closing? server-state) (stalled? l))
+                                     (recur))))
+                               ;; `stop!` stopping the executor.
+                               (catch InterruptedException _ nil))
                            ms (str (- (now) t0) "ms")]
                        (when-not (closing? server-state)
                          (cond
@@ -716,10 +848,9 @@
                            (log "the app at" path "has not loaded after" (str ms ";")
                                 "it is waiting for an earlier load to finish. Serving the others without it")
                            (:app r) (log "loaded the app at" path "in" ms)
-                           ;; `time-out!` has said so.
-                           (::not-loaded (ex-data (:error r))) nil
-                           :else (log "failed to load the app at" path "after" ms "-"
-                                      (ex-message (:error r))))))
+                           ;; A failure is logged as it happens (see
+                           ;; `run-load!` and `time-out!`).
+                           :else nil)))
                      (finally
                        (let [[before after] (swap-vals! starting disj path)]
                          (when (and (contains? before path) (empty? after) (running? server-state))
@@ -759,15 +890,22 @@
 
   The server listens at once. Every app in `:apps`, and every one
   already in `:apps-dir`, then loads in the background, so the first
-  visitors don't wait for them. Apps load one at a time, as Clojure's
-  `require` isn't thread-safe. A page or stream for an app still
-  loading waits for it, but no longer than `:app-load-timeout-ms`;
-  after that the app reports that it hasn't loaded (503). An app still
-  loading `:app-load-timeout-ms` after its turn came is interrupted and
-  fails, so a hung `app.clj` delays the apps loading after it until
-  then; it loads again when next requested. An app that fails or runs
-  out of time is logged and shows its error when opened; the others
-  are served as usual.
+  visitors don't wait for them. Apps load one at a time, through the
+  server's own queue, as Clojure's `require` isn't thread-safe; nothing
+  else waits on it, so sessions requiring namespaces carry on while
+  apps load. A page or stream for an app still loading waits for it,
+  but no longer than `:app-load-timeout-ms`; after that the app reports
+  that it hasn't loaded (503). An app still loading
+  `:app-load-timeout-ms` after its turn came fails, and is interrupted;
+  the next app in the queue starts loading then, so a hung `app.clj`
+  holds the others up for no longer than that. If it ignores the
+  interrupt (blocked on a socket, say), its thread is abandoned, and
+  carries on until it returns (its app is then served after all) or
+  the server restarts. An app that fails or runs out of time is logged,
+  and answers 503 with its error at once, without loading again, until
+  its files change (a directory app's; other sources until a restart):
+  the next request then loads it again. The others are served as
+  usual.
 
   `GET /_health` answers 200 with `{\"status\": \"ok\", \"sessions\": n}`
   while the server is running; 503 with `{\"status\": \"starting\",
@@ -796,6 +934,11 @@
                :pending (atom {})
                :streams (atom {})
                :loads (atom {})
+               ;; Apps load one at a time, each holding this (see
+               ;; `serializer`); first come, first served.
+               :load-permit (Semaphore. 1 true)
+               ;; Apps that failed to load (see `current-failure`).
+               :failures (atom {})
                :load-progress (atom (now))
                :starting (atom #{})
                ;; Loads apps and starts sessions (see `load!`). Daemon

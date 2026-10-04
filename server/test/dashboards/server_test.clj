@@ -15,7 +15,7 @@
            (java.util.stream Stream)
            (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)
-           (java.util.concurrent LinkedBlockingQueue TimeUnit)))
+           (java.util.concurrent CountDownLatch LinkedBlockingQueue TimeUnit)))
 
 (def counter-app
   (app/app {:title "Counter"
@@ -503,6 +503,8 @@
       (when s
         (binding [*server* s]
           (testing "while the hung app loads"
+            (is (wait-for #(= ["/hang"] (get (second (health)) "loading")) 1000)
+                "the other app loads at once")
             (let [[status body] (health)]
               (is (= 503 status) "the server isn't ready yet...")
               (is (= "starting" (get body "status")))
@@ -521,20 +523,20 @@
             (is (= "ok" (get (second (health)) "status")))
             (let [t1 (System/nanoTime)
                   {:keys [status body]} (http-get "/hang/")]
-              ;; Its load was interrupted and dropped, so this tries
-              ;; again -- and it hangs again.
-              (is (= 503 status) "the hung app reports that it hasn't loaded...")
-              (is (str/includes? body "has not finished loading"))
-              (is (< (ms-since t1) 4500) "...within the timeout"))
+              ;; Its load failed, and isn't tried again.
+              (is (= 503 status) "the hung app reports that it failed...")
+              (is (str/includes? body "The app at /hang failed to load: it took longer than 3000ms"))
+              (is (str/includes? body "restart the server to retry"))
+              (is (< (ms-since t1) 500) "...at once"))
             (let [c (open-stream {"dsh" {"session" ""}} "/hang")]
               (try
-                (await-event c (dashboards-event "failed") 5000)
-                (is (str/includes? (get-in (await-event c (dashboards-event "notify") 2000) [:data "message"])
-                                   "has not finished loading"))
+                (await-event c (dashboards-event "failed") 1000)
+                (is (str/includes? (get-in (await-event c (dashboards-event "notify") 1000) [:data "message"])
+                                   "failed to load"))
                 (finally ((:close c)))))
             (let [{:keys [status body]} (http-get "/")]
               (is (= 200 status))
-              (is (str/includes? body "Not loaded yet")))
+              (is (str/includes? body "Failed to load")))
             (is (str/includes? (:body (http-get "/ok/")) "<title>Counter</title>")))))
       (finally
         (deliver release true)
@@ -770,6 +772,12 @@
 (defn- await-hang-event [ms]
   (.poll ^LinkedBlockingQueue hang-events ms TimeUnit/MILLISECONDS))
 
+(defn- touch!
+  "Give `f` a later modification time than it had, as an edit would,
+  however coarse the file system's clock."
+  [^java.io.File f]
+  (.setLastModified f (+ (.lastModified f) 5000)))
+
 (deftest a-hung-app-is-interrupted-and-the-next-one-loads
   (.clear ^LinkedBlockingQueue hang-events)
   (let [root (temp-dir)
@@ -795,52 +803,217 @@
             (is (wait-for #(= 200 (first (health))) 2000))
             (let [{:keys [status body]} (http-get "/hang/")]
               (is (= 503 status))
-              (is (str/includes? body "has not finished loading")))))
+              (is (str/includes? body "failed to load"))
+              (is (str/includes? body "fix its files to retry")))))
         (testing "a hung app whose file is fixed loads"
-          ;; The request above tried it again, and it hung again.
-          (is (= :entered (await-hang-event 1000)))
-          (is (= :interrupted (await-hang-event 5000)))
-          (Thread/sleep 1100) ; file mtimes can be second-granular
+          (is (nil? (await-hang-event 300)) "the request above didn't load it again")
           (write-titled-app! hang "hang.app" "Fixed" "")
+          (touch! (io/file hang "app.clj")) ; file mtimes can be second-granular
           (let [{:keys [status body]} (http-get "/hang/")]
             (is (= 200 status))
             (is (str/includes? body "<title>Fixed</title>")))
           (is (str/includes? (:body (http-get "/later/")) "<title>Later</title>"))))
       (finally (server/stop! s)))))
 
-(def stubborn-release "Lets the stubborn test app finish loading." (atom false))
+
+(defn await-ignoring-interrupts
+  "Wait for `latch`, carrying on through interrupts, as code blocked in
+  socket IO (or a loop that never looks) does. Reports each interrupt
+  to `hang-events`."
+  [^CountDownLatch latch]
+  (loop []
+    (when-not (try (.await latch) true
+                   (catch InterruptedException _
+                     (.put ^LinkedBlockingQueue hang-events :interrupted)
+                     false))
+      (recur))))
+
+(def stuck-latch "What the stuck test apps wait for." (atom (CountDownLatch. 0)))
+
+(defn- write-stuck-app!
+  "Write an app directory whose app.clj waits for `stuck-latch`,
+  ignoring interruption."
+  [dir ns-name title]
+  (write-titled-app! dir ns-name title
+                     (str "(.put dashboards.server-test/hang-events :entered)\n"
+                          "(dashboards.server-test/await-ignoring-interrupts @dashboards.server-test/stuck-latch)")))
 
 (deftest an-app-that-ignores-interruption
-  (reset! stubborn-release false)
   (.clear ^LinkedBlockingQueue hang-events)
-  (let [root (temp-dir)
-        _ (write-titled-app! (io/file root "stubborn") "stubborn.app" "Stubborn"
-                             (str "(.put dashboards.server-test/hang-events :entered)\n"
-                                  "(while (not @dashboards.server-test/stubborn-release)"
-                                  " (try (Thread/sleep 50) (catch InterruptedException _"
-                                  " (.put dashboards.server-test/hang-events :interrupted))))"))
-        s (server/start! {:port 0 :host "127.0.0.1" :apps-dir (str root) :app-load-timeout-ms 1500})]
+  (let [latch (reset! stuck-latch (CountDownLatch. 1))
+        timeout 1500
+        root (temp-dir)
+        _ (write-stuck-app! (io/file root "stuck") "stuck.app" "Stuck")
+        s (server/start! {:port 0 :host "127.0.0.1" :apps-dir (str root) :app-load-timeout-ms timeout})]
     (try
       (binding [*server* s]
         (is (= :entered (await-hang-event 10000)))
-        (write-titled-app! (io/file root "queued") "queued.app" "Queued" "")
-        (testing "keeps the apps after it waiting, but every request is answered within the timeout"
+        (testing "doesn't keep the apps queued after it from loading"
+          (write-titled-app! (io/file root "queued") "queued.app" "Queued" "")
+          (let [t0 (System/nanoTime)]
+            (is (wait-for #(= 200 (:status (http-get "/queued/"))) (* 3 timeout))
+                "it loads once the stuck one runs out of time...")
+            (is (< (ms-since t0) (+ timeout 1000)) "...within about the timeout")
+            (is (str/includes? (:body (http-get "/queued/")) "<title>Queued</title>"))))
+        (is (= :interrupted (await-hang-event 2000)) "the stuck app was interrupted, and carried on")
+        (testing "it reports its failure at once"
           (let [t0 (System/nanoTime)
-                {:keys [status body]} (http-get "/queued/")]
+                {:keys [status body]} (http-get "/stuck/")]
             (is (= 503 status))
-            (is (str/includes? body "waiting for an earlier load to finish"))
-            (is (< (ms-since t0) 2500)))
-          (is (= :interrupted (await-hang-event 2000)) "it was interrupted, and carried on")
-          (let [t0 (System/nanoTime)
-                {:keys [status body]} (http-get "/stubborn/")]
-            (is (= 503 status))
-            (is (str/includes? body "has not finished loading"))
-            (is (< (ms-since t0) 2500))))
-        (testing "once it finishes, they load"
-          (reset! stubborn-release true)
-          (is (wait-for #(= 200 (:status (http-get "/queued/"))) 5000))
-          (is (str/includes? (:body (http-get "/stubborn/")) "<title>Stubborn</title>")
-              "and it too, having loaded meanwhile")))
+            (is (str/includes? body "failed to load"))
+            (is (str/includes? body "fix its files to retry"))
+            (is (< (ms-since t0) 200))))
+        (is (= 200 (first (health))) "and the server is ready")
+        (testing "if it finishes after all, it is served"
+          (.countDown latch)
+          (is (wait-for #(= 200 (:status (http-get "/stuck/"))) 5000))
+          (is (str/includes? (:body (http-get "/stuck/")) "<title>Stuck</title>"))))
       (finally
-        (reset! stubborn-release true)
+        (.countDown latch)
         (server/stop! s)))))
+
+(deftest requiring-a-namespace-while-an-app-hangs
+  ;; Sessions may `requiring-resolve` at any time; an app stuck loading
+  ;; mustn't hold them up.
+  (.clear ^LinkedBlockingQueue hang-events)
+  (is (nil? (find-ns 'dashboards.lazy-fixture-a)) "the namespace isn't loaded yet")
+  (let [latch (reset! stuck-latch (CountDownLatch. 1))
+        root (temp-dir)
+        _ (write-stuck-app! (io/file root "stuck") "stuck2.app" "Stuck")
+        s (server/start! {:port 0 :host "127.0.0.1" :apps-dir (str root) :app-load-timeout-ms 30000})]
+    (try
+      (is (= :entered (await-hang-event 10000)))
+      (let [t0 (System/nanoTime)
+            resolved (future @(requiring-resolve 'dashboards.lazy-fixture-a/answer))]
+        (is (= 42 (deref resolved 2000 ::blocked)) "requiring-resolve isn't blocked by the stuck load")
+        (is (< (ms-since t0) 2000)))
+      (finally
+        (.countDown latch)
+        (server/stop! s)))))
+
+(deftest a-failed-app-answers-at-once
+  (.clear ^LinkedBlockingQueue hang-events)
+  (let [root (temp-dir)
+        _ (write-titled-app! (io/file root "hang") "hang3.app" "Hang"
+                             (str "(.put dashboards.server-test/hang-events :entered)\n"
+                                  "(Thread/sleep Long/MAX_VALUE)"))
+        other (io/file root "other")
+        _ (write-titled-app! other "other3.app" "Other v1" "")
+        s (server/start! {:port 0 :host "127.0.0.1" :apps-dir (str root) :app-load-timeout-ms 2000})]
+    (try
+      (binding [*server* s]
+        (is (= :entered (await-hang-event 10000)))
+        (is (wait-for #(= 200 (first (health))) 5000))
+        (is (str/includes? (:body (http-get "/other/")) "Other v1"))
+        (testing "requests for an app that ran out of time answer 503 at once"
+          (dotimes [_ 5]
+            (let [t0 (System/nanoTime)
+                  {:keys [status body]} (http-get "/hang/")]
+              (is (= 503 status))
+              (is (str/includes? body "The app at /hang failed to load"))
+              (is (< (ms-since t0) 200)))))
+        (testing "and don't hold up another app reloading"
+          (let [stop? (atom false)
+                hammers (doall (for [_ (range 4)]
+                                 (future (while (not @stop?) (http-get "/hang/")))))]
+            (try
+              (Thread/sleep 200)
+              (write-titled-app! other "other3.app" "Other v2" "")
+              (touch! (io/file other "app.clj"))
+              (let [t0 (System/nanoTime)
+                    {:keys [status body]} (http-get "/other/")]
+                (is (= 200 status))
+                (is (str/includes? body "Other v2"))
+                (is (< (ms-since t0) 500) "the reload isn't held up"))
+              (finally (reset! stop? true) (run! deref hammers)))))
+        (is (nil? (await-hang-event 200)) "the failed app wasn't loaded again")
+        (testing "nor does the index page load it again"
+          (let [t0 (System/nanoTime)
+                {:keys [status body]} (http-get "/")]
+            (is (= 200 status))
+            (is (str/includes? body "Failed to load"))
+            (is (< (ms-since t0) 500))
+            (is (nil? (await-hang-event 200))))))
+      (finally (server/stop! s)))))
+
+(def attempts "How often the flaky test app has been loaded." (atom 0))
+
+(deftest a-failed-app-is-tried-again-when-its-files-change
+  (reset! attempts 0)
+  (let [root (temp-dir)
+        dir (io/file root "flaky")
+        file (io/file dir "app.clj")
+        write! (fn [body]
+                 (let [before (.lastModified file)]
+                   (write-titled-app! dir "flaky.app" "Flaky"
+                                      (str "(swap! dashboards.server-test/attempts inc)\n" body))
+                   ;; Later than before, however coarse the file system's clock.
+                   (.setLastModified file (+ (max before (.lastModified file)) 5000))))
+        _ (write! "(throw (ex-info \"broken v1\" {}))")
+        s (server/start! {:port 0 :host "127.0.0.1" :apps-dir (str root) :app-load-timeout-ms 10000})]
+    (try
+      (binding [*server* s]
+        (is (wait-for #(= 200 (first (health))) 10000))
+        (is (= 1 @attempts))
+        (let [{:keys [status body]} (http-get "/flaky/")]
+          (is (= 503 status))
+          (is (str/includes? body "broken v1") body)
+          (is (str/includes? body "fix its files to retry")))
+        (dotimes [_ 5] (is (= 503 (:status (http-get "/flaky/")))))
+        (is (= 1 @attempts) "it isn't loaded again while its files stay as they are")
+        (testing "touching its file has it loaded again, once"
+          (touch! file)
+          (let [rs (doall (for [_ (range 5)] (future (http-get "/flaky/"))))]
+            (is (every? #(= 503 (:status @%)) rs)))
+          (is (= 503 (:status (http-get "/flaky/"))))
+          (is (= 2 @attempts)))
+        (testing "fixed, it loads"
+          (write! "")
+          (let [{:keys [status body]} (http-get "/flaky/")]
+            (is (= 200 status))
+            (is (str/includes? body "<title>Flaky</title>")))
+          (is (= 3 @attempts))
+          (http-get "/flaky/")
+          (is (= 3 @attempts))))
+      (finally (server/stop! s)))))
+
+(deftest an-app-that-loads-a-namespace-on-another-thread
+  ;; An app.clj that waits on a future that requires a namespace (a
+  ;; parallel prep step, say) mustn't deadlock with its own load.
+  (is (nil? (find-ns 'dashboards.lazy-fixture-b)) "the namespace isn't loaded yet")
+  (let [root (temp-dir)
+        _ (write-titled-app! (io/file root "par") "par.app" "Parallel"
+                             "(def answer @(future @(requiring-resolve 'dashboards.lazy-fixture-b/answer)))")
+        t0 (System/nanoTime)
+        s (server/start! {:port 0 :host "127.0.0.1" :apps-dir (str root) :app-load-timeout-ms 10000})]
+    (try
+      (binding [*server* s]
+        (is (wait-for #(= 200 (first (health))) 10000))
+        (is (< (ms-since t0) 5000) "well before the timeout")
+        (let [{:keys [status body]} (http-get "/par/")]
+          (is (= 200 status))
+          (is (str/includes? body "<title>Parallel</title>"))))
+      (finally (server/stop! s)))))
+
+(deftest stopping-while-apps-load
+  (let [uncaught (atom [])
+        old (Thread/getDefaultUncaughtExceptionHandler)
+        entered (promise)
+        release (promise)
+        source (reify apps/AppSource
+                 (resolve-app [_] (deliver entered true) (deref release) counter-app)
+                 (source-dir [_] nil))]
+    (Thread/setDefaultUncaughtExceptionHandler
+     (reify java.lang.Thread$UncaughtExceptionHandler
+       (uncaughtException [_ _ e] (swap! uncaught conj e))))
+    (try
+      (let [s (server/start! {:port 0 :host "127.0.0.1" :app-load-timeout-ms 60000
+                              :apps [{:path "/a" :app source} {:path "/b" :app (hung-source release)}]})]
+        (is (true? (deref entered 5000 nil)) "an app is loading")
+        (Thread/sleep 200)
+        (is (nil? (deref (future (server/stop! s)) 5000 ::timeout)) "stop! returns")
+        (Thread/sleep 500)
+        (is (empty? @uncaught) (str "no thread died of an uncaught exception: " (mapv str @uncaught))))
+      (finally
+        (deliver release true)
+        (Thread/setDefaultUncaughtExceptionHandler old)))))

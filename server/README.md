@@ -44,10 +44,14 @@ every one already in `--apps-dir`, in the background and one at a time,
 so the first visitors don't wait for them; `/_health` reports
 `"starting"` (503) until each has loaded, failed, or run out of time
 (`:app-load-timeout-ms`, default 60000). A request for an app still
-loading waits no longer than that. An app that fails or runs out of time
-is logged and shows its error when opened, while the rest are served as
-usual; a hung `app.clj` delays the apps loaded after it until the
-timeout interrupts it.
+loading waits no longer than that. Apps load through the server's own
+queue, which nothing else waits on, so sessions can require namespaces
+while apps load. A hung `app.clj` fails after the timeout and stops
+holding up the apps queued behind it; if it ignores being interrupted
+(blocked on a socket, say), its thread is abandoned until it returns or
+the server restarts. An app that fails or runs out of time is logged
+and answers 503 with its error at once, without loading again, until
+its files change; the rest are served as usual.
 
 ```clojure
 io.github.kirahowe/dashboards-server
