@@ -354,10 +354,17 @@ out of time (`:app-load-timeout-ms`, default 60000, or
 traffic back until the apps are warm. A request for an app still
 loading waits for it, up to that timeout; an app that fails or runs out
 of time is logged and reports its error when opened, while the others
-are served as usual. An `app.clj` that hangs (on a database connection,
-say) delays the apps loaded after it until the timeout interrupts it,
-then fails on its own; it loads again when next requested. Give the
-timeout room for apps whose `deps.edn` fetches libraries on first start.
+are served as usual. Apps load one at a time through the server's own
+queue, and nothing else waits on it: sessions requiring namespaces
+carry on while apps load. An `app.clj` that hangs (on a database
+connection, say) fails after the timeout and is interrupted, and the
+next app in the queue starts loading then. If it ignores the interrupt
+(blocked reading a socket, say), its thread is abandoned: it carries on
+until it returns (and its app is then served) or the server restarts.
+A failed app answers 503 with its error at once, without loading again,
+until its files change; the next request after that loads it again.
+Give the timeout room for apps whose `deps.edn` fetches libraries on
+first start.
 
 **Deploys and shutdown.** When the server is stopped (SIGTERM, or
 `server/stop!`), it:

@@ -16,8 +16,10 @@
     added to the running server when the app loads.
 
   Clojure's `require` isn't thread-safe, so symbols and directories
-  load one at a time: under Clojure's own require lock, the one
-  `requiring-resolve` takes (see `serialized`)."
+  load one at a time, through the server's own queue (see
+  `serialized`). Only loads wait on that queue: code that requires a
+  namespace meanwhile -- in a session, or in a future an `app.clj`
+  waits for -- carries on as usual."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
@@ -46,34 +48,48 @@
   (resolve-app [_] (ensure-app @v (str v)))
   (source-dir [_] nil))
 
-(def ^:dynamic *on-load-phase*
-  "When bound, a function `serialized` calls with `:waiting` just
-  before it waits for the require lock, and with `:loading` once it
-  holds it -- so that a caller can time the load itself, not the wait."
+;; Loads are not run under Clojure's own require lock
+;; (`clojure.lang.RT/REQUIRE_LOCK`, which `requiring-resolve` takes): an
+;; `app.clj` that hangs, ignoring interruption, would hold it for good,
+;; and with it every app still to load, and every `requiring-resolve`
+;; of a namespace not loaded yet, anywhere in the process.
+
+(def ^:dynamic *serializer*
+  "When bound, the function `serialized` hands each load to. It calls
+  its argument, a function of no arguments, once the load's turn has
+  come, and returns what that returns. The server binds it while it
+  loads an app, to its own queue, which also times the load (see
+  `dashboards.server`)."
   nil)
 
+(def ^:private ^:dynamic *serialized?*
+  "Whether this thread's load has its turn already." false)
+
+(def ^:private standalone-lock
+  "Serializes loads made with no `*serializer*` bound, as at the REPL."
+  (Object.))
+
 (defn serialized
-  "Call `f` holding Clojure's require lock (`clojure.lang.RT/REQUIRE_LOCK`,
-  the one `requiring-resolve` takes), so that it loads code one at a
-  time with every other caller, and every serialized require. Throws
-  InterruptedException, without calling `f`, if the thread was
-  interrupted while it waited."
+  "Call `f`, a load, once it is its turn: one at a time with other
+  loads, through `*serializer*` (the server's queue) or, with none
+  bound, a lock of this namespace's own. Only loads wait for either.
+  Within a load that has its turn already (a directory app's, loading
+  its own code), `f` runs at once."
   [f]
-  (if (Thread/holdsLock clojure.lang.RT/REQUIRE_LOCK)
-    (f)
-    (do (when-let [on-phase *on-load-phase*] (on-phase :waiting))
-        (locking clojure.lang.RT/REQUIRE_LOCK
-          ;; Waiting for a monitor can't be interrupted, so look now.
-          (when (Thread/interrupted)
-            (throw (InterruptedException. "interrupted while waiting to load")))
-          (when-let [on-phase *on-load-phase*] (on-phase :loading))
-          (f)))))
+  (cond
+    *serialized?* (f)
+    *serializer* (*serializer* #(binding [*serialized?* true] (f)))
+    :else (locking standalone-lock
+            (binding [*serialized?* true] (f)))))
 
 (defrecord SymbolSource [sym]
   AppSource
   (resolve-app [_]
     (let [v (or (resolve sym)
-                (serialized #(requiring-resolve sym))
+                ;; `require`, not `requiring-resolve`, which takes
+                ;; Clojure's require lock (see `serialized`).
+                (serialized #(do (require (symbol (namespace sym)))
+                                 (resolve sym)))
                 (throw (ex-info (str "Could not resolve " sym) {:symbol sym})))]
       (ensure-app @v (str sym))))
   (source-dir [_] nil))
@@ -127,12 +143,12 @@
   (resolve-app [_]
     (let [current #(let [{:keys [app fp]} @state]
                      (when (and app (or (not reload?) (= fp (fingerprint dir)))) app))]
-      ;; Only (re)loading takes the lock: an app already loaded is
+      ;; Only (re)loading waits its turn: an app already loaded is
       ;; served even while another app loads.
       (or (current)
           (serialized
            (fn []
-             ;; Loaded by whoever held the lock before.
+             ;; Loaded by the load before this one.
              (or (current)
                  (let [fp (fingerprint dir)
                        app (load-app-dir dir)]
@@ -144,6 +160,27 @@
 
 (defn dir-source [dir & {:keys [reload?] :or {reload? true}}]
   (->DirSource (.getAbsoluteFile (io/file dir)) (atom {}) reload?))
+
+(defn source-fingerprint
+  "A value that changes when `src` may load differently than before:
+  for a directory that reloads, its files' modification times; for a
+  var, its value. Otherwise constant, as nothing short of a restart
+  changes how it loads. The server keeps an app that failed to load
+  failed until this changes (see `retry-hint`)."
+  [src]
+  (cond
+    (and (instance? DirSource src) (:reload? src)) [::files (fingerprint (:dir src))]
+    (instance? VarSource src) [::var (System/identityHashCode (deref (:v src)))]
+    :else ::fixed))
+
+(defn retry-hint
+  "What has an app source that failed to load tried again (see
+  `source-fingerprint`)."
+  [src]
+  (cond
+    (and (instance? DirSource src) (:reload? src)) "fix its files to retry"
+    (instance? VarSource src) "redefine its var to retry"
+    :else "restart the server to retry"))
 
 (defn ->source
   "Turn an app, var, symbol or directory into an `AppSource`."

@@ -31,8 +31,9 @@
  ;; :shutdown-delay-ms 5000
 
  ;; Apps load in the background, one at a time, as the server starts
- ;; (a hung app.clj delays those after it until this timeout
- ;; interrupts it); /_health reports
+ ;; (a hung app.clj fails after this timeout, and stops holding up
+ ;; the others; a failed app is loaded again when its files change);
+ ;; /_health reports
  ;; 503 "starting" until each has loaded, failed or taken longer than
  ;; this, and nothing waits longer than this for an app. Can also be set
  ;; with --app-load-timeout-ms or DASHBOARDS_APP_LOAD_TIMEOUT_MS.

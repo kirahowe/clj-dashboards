@@ -31,9 +31,12 @@
   environment variables.
 
   The server listens at once and loads its apps in the background, one
-  at a time: /_health answers 503 (\"starting\") until each has loaded,
-  failed or run out of time. A hung app.clj delays the apps loaded
-  after it until the timeout interrupts it.
+  at a time through its own queue: /_health answers 503 (\"starting\")
+  until each has loaded, failed or run out of time. A hung app.clj
+  fails after the timeout and stops holding up the others; if it
+  ignores being interrupted, its thread is abandoned (restart to
+  reclaim it). A failed app answers 503 at once until its files
+  change, when it is loaded again.
 
   On SIGTERM the server stops gracefully (see
   `dashboards.server/stop!`): /_health answers 503 while it drains,
